@@ -5,28 +5,23 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // ── Dependencies ──
-    const xev_dep = b.dependency("libxev", .{
+    // zio async I/O (coroutine-based)
+    // Force io_uring on Linux
+    const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
+        .backend = if (target.result.os.tag == .linux) @as(?[]const u8, "io_uring") else null,
     });
-
-    // ── xev backend wrapper (epoll on Linux, IOCP on Windows) ──
-    const xev_raw = xev_dep.module("xev");
-    const xev_mod = b.createModule(.{
-        .root_source_file = b.path("src/xev_backend.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    xev_mod.addImport("xev_raw", xev_raw);
+    const zio_mod = zio_dep.module("zio");
 
     // ── Helper: configure a compile step with all dependencies ──
     const configureStep = struct {
         fn apply(
             step: *std.Build.Step.Compile,
-            xev: *std.Build.Module,
+            zio: *std.Build.Module,
             t: std.Build.ResolvedTarget,
         ) void {
-            step.root_module.addImport("xev", xev);
+            step.root_module.addImport("zio", zio);
 
             // BoringSSL (NASM-accelerated prebuilt: AES-NI, SHA, GHASH, ChaCha20, P256, etc.)
             step.addIncludePath(.{ .cwd_relative = "deps/boringssl/include" });
@@ -72,7 +67,7 @@ pub fn build(b: *std.Build) void {
             .unwind_tables = if (profile) .@"async" else null,
         }),
     });
-    configureStep(exe, xev_mod, target);
+    configureStep(exe, zio_mod, target);
     b.installArtifact(exe);
 
     // ── Run step ──
@@ -92,7 +87,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    configureStep(unit_tests, xev_mod, target);
+    configureStep(unit_tests, zio_mod, target);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

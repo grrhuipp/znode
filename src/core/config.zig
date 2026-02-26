@@ -511,82 +511,6 @@ pub const RouteEntry = struct {
     outs: []const OutConfig, // outbound endpoints (pre-processed)
 };
 
-// ── Sub-configs ──
-
-pub const DnsConfig = struct {
-    servers: []const []const u8 = &.{"8.8.8.8"},
-    routes: [max_dns_routes]DnsRoute = [_]DnsRoute{.{}} ** max_dns_routes,
-    route_count: u8 = 0,
-    cache_size: u32 = 4096,
-    min_ttl: u32 = 60,
-    max_ttl: u32 = 3600,
-
-    pub const max_dns_routes = 8;
-};
-
-/// DNS routing rule: maps domain suffixes to a specific DNS server.
-pub const DnsRoute = struct {
-    server_buf: [64]u8 = [_]u8{0} ** 64,
-    server_len: u8 = 0,
-    suffixes: [max_suffixes][64]u8 = undefined,
-    suffix_lens: [max_suffixes]u8 = [_]u8{0} ** max_suffixes,
-    suffix_count: u8 = 0,
-
-    const max_suffixes = 16;
-
-    pub fn getServer(self: *const DnsRoute) []const u8 {
-        return self.server_buf[0..self.server_len];
-    }
-
-    pub fn setServer(self: *DnsRoute, v: []const u8) void {
-        const n: u8 = @intCast(@min(v.len, self.server_buf.len));
-        @memcpy(self.server_buf[0..n], v[0..n]);
-        self.server_len = n;
-    }
-
-    pub fn addSuffix(self: *DnsRoute, s: []const u8) void {
-        if (self.suffix_count >= max_suffixes) return;
-        const n: u8 = @intCast(@min(s.len, 64));
-        @memcpy(self.suffixes[self.suffix_count][0..n], s[0..n]);
-        self.suffix_lens[self.suffix_count] = n;
-        self.suffix_count += 1;
-    }
-
-    /// Check if a domain matches any of this route's suffixes.
-    pub fn matchesDomain(self: *const DnsRoute, domain: []const u8) bool {
-        for (0..self.suffix_count) |i| {
-            const suffix = self.suffixes[i][0..self.suffix_lens[i]];
-            if (suffix.len == 0) continue;
-            if (std.mem.eql(u8, domain, suffix)) return true;
-            if (domain.len > suffix.len + 1) {
-                const tail = domain[domain.len - suffix.len ..];
-                if (std.mem.eql(u8, tail, suffix) and domain[domain.len - suffix.len - 1] == '.') {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-};
-
-pub const DispatchStrategy = enum {
-    least_connections,
-    round_robin,
-    random,
-    ip_hash,
-};
-
-pub const LimitsConfig = struct {
-    max_connections: u32 = 0,
-    max_conn_per_ip: u32 = 0,
-    handshake_timeout_ms: u32 = 30_000, // 30s default — prevents half-open connections hanging forever
-    relay_idle_timeout_ms: u32 = 15_000, // 15s default — reclaims idle connections promptly
-    half_close_grace_ms: u32 = 5_000, // 5s hard cap on half-close duration
-    buffer_pool_max_mb: u32 = 0,
-    vmess_hot_cache_ttl: u32 = 300, // seconds, 0 = disabled
-    dispatch_strategy: DispatchStrategy = .least_connections,
-};
-
 // ── Main Config ──
 
 pub const Config = struct {
@@ -603,15 +527,12 @@ pub const Config = struct {
     listeners: [max_config_listeners]ListenerConfig = [_]ListenerConfig{.{}} ** max_config_listeners,
     listener_count: u8 = 0,
 
-    // Sub-configs
-    dns: DnsConfig = .{},
-    limits: LimitsConfig = .{},
-
     // Log settings
     log_dir: [256]u8 = [_]u8{0} ** 256,
     log_dir_len: u16 = 0,
     log_max_days: u16 = 7,
     log_clean_on_start: bool = false,
+    log_console: bool = false,
 
     // Geo database paths (relative to config dir, or absolute; default: geoip.dat / geosite.dat)
     geoip_path: [256]u8 = [_]u8{0} ** 256,
@@ -747,9 +668,7 @@ const Section = enum {
     panel,
     routes,
     routes_outs,
-    limits,
-    dns,
-    dns_routes,
+    ignore,
     listeners,
 };
 
@@ -799,15 +718,15 @@ pub fn parseToml(allocator: std.mem.Allocator, content: []const u8) !Config {
                 pending_password = "";
                 pending_cipher = "";
             } else if (eqlIgnoreCase(name, "dns.routes")) {
-                section = .dns_routes;
-                if (config.dns.route_count < DnsConfig.max_dns_routes) {
-                    config.dns.route_count += 1;
-                }
+                // DNS config is removed; keep backward compatibility by ignoring.
+                section = .ignore;
             } else if (eqlIgnoreCase(name, "listeners")) {
                 section = .listeners;
                 if (config.listener_count < max_config_listeners) {
                     config.listener_count += 1;
                 }
+            } else {
+                section = .ignore;
             }
             continue;
         }
@@ -818,10 +737,11 @@ pub fn parseToml(allocator: std.mem.Allocator, content: []const u8) !Config {
                 finalizeOutConfig(&route_list, pending_password, pending_cipher);
             }
             const name = parseSectionName(trimmed);
-            if (eqlIgnoreCase(name, "limits")) {
-                section = .limits;
-            } else if (eqlIgnoreCase(name, "dns")) {
-                section = .dns;
+            if (eqlIgnoreCase(name, "dns")) {
+                // DNS config is removed; keep backward compatibility by ignoring.
+                section = .ignore;
+            } else {
+                section = .ignore;
             }
             continue;
         }
@@ -847,12 +767,7 @@ pub fn parseToml(allocator: std.mem.Allocator, content: []const u8) !Config {
                     }
                 }
             },
-            .limits => applyLimitsKV(&config.limits, kv.key, kv.value),
-            .dns => applyDnsKV(&config.dns, kv.key, kv.value),
-            .dns_routes => {
-                if (config.dns.route_count > 0)
-                    applyDnsRouteKV(&config.dns.routes[config.dns.route_count - 1], kv.key, kv.value);
-            },
+            .ignore => {},
             .listeners => {
                 if (config.listener_count > 0)
                     applyListenerKV(&config.listeners[config.listener_count - 1], kv.key, kv.value);
@@ -998,6 +913,8 @@ fn applyRootKV(config: *Config, key: []const u8, val: []const u8) void {
         if (parseTomlInt(val)) |v| config.log_max_days = @intCast(@max(1, @min(v, 365)));
     } else if (eql(u8, key, "log_clean_on_start")) {
         if (parseTomlBool(val)) |v| config.log_clean_on_start = v;
+    } else if (eql(u8, key, "log_console")) {
+        if (parseTomlBool(val)) |v| config.log_console = v;
     } else if (eql(u8, key, "workers")) {
         if (parseTomlInt(val)) |v| config.workers = @intCast(@max(0, @min(v, 64)));
     } else if (eql(u8, key, "geoip_path")) {
@@ -1153,58 +1070,6 @@ fn applyOutKV(out: *OutConfig, key: []const u8, val: []const u8, pending_passwor
     }
 }
 
-fn applyLimitsKV(limits: *LimitsConfig, key: []const u8, val: []const u8) void {
-    if (eql(u8, key, "max_connections")) {
-        if (parseTomlInt(val)) |v| limits.max_connections = @intCast(@max(0, v));
-    } else if (eql(u8, key, "max_conn_per_ip")) {
-        if (parseTomlInt(val)) |v| limits.max_conn_per_ip = @intCast(@max(0, v));
-    } else if (eql(u8, key, "handshake_timeout_ms")) {
-        if (parseTomlInt(val)) |v| limits.handshake_timeout_ms = @intCast(@max(0, v));
-    } else if (eql(u8, key, "relay_idle_timeout_ms")) {
-        if (parseTomlInt(val)) |v| limits.relay_idle_timeout_ms = @intCast(@max(0, v));
-    } else if (eql(u8, key, "half_close_grace_ms")) {
-        if (parseTomlInt(val)) |v| limits.half_close_grace_ms = @intCast(@max(0, v));
-    } else if (eql(u8, key, "buffer_pool_max_mb")) {
-        if (parseTomlInt(val)) |v| limits.buffer_pool_max_mb = @intCast(@max(0, v));
-    } else if (eql(u8, key, "vmess_hot_cache_ttl")) {
-        if (parseTomlInt(val)) |v| limits.vmess_hot_cache_ttl = @intCast(@max(0, v));
-    } else if (eql(u8, key, "dispatch_strategy")) {
-        const s = parseTomlString(val);
-        if (eql(u8, s, "round_robin")) {
-            limits.dispatch_strategy = .round_robin;
-        } else if (eql(u8, s, "random")) {
-            limits.dispatch_strategy = .random;
-        } else if (eql(u8, s, "ip_hash")) {
-            limits.dispatch_strategy = .ip_hash;
-        } else {
-            limits.dispatch_strategy = .least_connections;
-        }
-    }
-}
-
-fn applyDnsKV(dns: *DnsConfig, key: []const u8, val: []const u8) void {
-    if (eql(u8, key, "cache_size")) {
-        if (parseTomlInt(val)) |v| dns.cache_size = @intCast(@max(0, v));
-    } else if (eql(u8, key, "min_ttl")) {
-        if (parseTomlInt(val)) |v| dns.min_ttl = @intCast(@max(0, v));
-    } else if (eql(u8, key, "max_ttl")) {
-        if (parseTomlInt(val)) |v| dns.max_ttl = @intCast(@max(0, v));
-    }
-}
-
-fn applyDnsRouteKV(route: *DnsRoute, key: []const u8, val: []const u8) void {
-    if (eql(u8, key, "server")) {
-        route.setServer(parseTomlString(val));
-    } else if (eql(u8, key, "domains")) {
-        // Parse inline array; copy into fixed buffers via addSuffix
-        const arr = parseTomlStringArray(std.heap.page_allocator, val) catch return;
-        defer std.heap.page_allocator.free(arr);
-        for (arr) |s| {
-            route.addSuffix(s);
-        }
-    }
-}
-
 fn applyListenerKV(lc: *ListenerConfig, key: []const u8, val: []const u8) void {
     if (eql(u8, key, "name")) {
         lc.setName(parseTomlString(val));
@@ -1305,11 +1170,16 @@ fn parseRouteToml(config: *Config, allocator: std.mem.Allocator, content: []cons
                 }
                 pending_password = "";
                 pending_cipher = "";
+            } else {
+                section = .ignore;
             }
             continue;
         }
 
-        if (trimmed[0] == '[') continue; // skip other table headers
+        if (trimmed[0] == '[') {
+            section = .ignore;
+            continue; // skip other table headers
+        }
 
         const kv = parseKeyValue(trimmed) orelse continue;
         switch (section) {
@@ -1343,45 +1213,6 @@ fn parseRouteToml(config: *Config, allocator: std.mem.Allocator, content: []cons
     }
     config.routes = route_entries.toOwnedSlice(allocator) catch &.{};
     route_list.deinit(allocator);
-}
-
-fn parseDnsToml(config: *Config, content: []const u8) void {
-    var section: Section = .root;
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, " \t\r");
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
-
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-
-        if (trimmed.len > 4 and trimmed[0] == '[' and trimmed[1] == '[') {
-            const name = parseArrayTableName(trimmed);
-            if (eqlIgnoreCase(name, "dns.routes") or eqlIgnoreCase(name, "routes")) {
-                section = .dns_routes;
-                if (config.dns.route_count < DnsConfig.max_dns_routes) {
-                    config.dns.route_count += 1;
-                }
-            }
-            continue;
-        }
-
-        if (trimmed[0] == '[') {
-            const name = parseSectionName(trimmed);
-            if (eqlIgnoreCase(name, "dns")) section = .dns;
-            continue;
-        }
-
-        const kv = parseKeyValue(trimmed) orelse continue;
-        switch (section) {
-            .root, .dns => applyDnsKV(&config.dns, kv.key, kv.value),
-            .dns_routes => {
-                if (config.dns.route_count > 0)
-                    applyDnsRouteKV(&config.dns.routes[config.dns.route_count - 1], kv.key, kv.value);
-            },
-            else => {},
-        }
-    }
 }
 
 // ── Helpers ──
@@ -1450,22 +1281,6 @@ test "parseToml default log config" {
     defer config.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 0), config.log_dir_len);
     try std.testing.expectEqual(@as(u16, 7), config.log_max_days);
-}
-
-test "parseToml with limits config" {
-    const allocator = std.testing.allocator;
-    var config = try parseToml(allocator,
-        \\[limits]
-        \\max_connections = 5000
-        \\max_conn_per_ip = 100
-        \\buffer_pool_max_mb = 512
-    );
-    defer config.deinit(allocator);
-    try std.testing.expectEqual(@as(u32, 5000), config.limits.max_connections);
-    try std.testing.expectEqual(@as(u32, 100), config.limits.max_conn_per_ip);
-    try std.testing.expectEqual(@as(u32, 512), config.limits.buffer_pool_max_mb);
-    try std.testing.expectEqual(@as(u32, 30_000), config.limits.handshake_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 15_000), config.limits.relay_idle_timeout_ms);
 }
 
 test "parseToml with panel" {
@@ -1710,19 +1525,7 @@ test "Config deinit with panel and routes" {
     config.deinit(allocator);
 }
 
-test "DnsRoute matchesDomain suffix" {
-    var route = DnsRoute{};
-    route.addSuffix("cn");
-    route.addSuffix("baidu.com");
-
-    try std.testing.expect(route.matchesDomain("google.cn"));
-    try std.testing.expect(route.matchesDomain("test.baidu.com"));
-    try std.testing.expect(route.matchesDomain("baidu.com"));
-    try std.testing.expect(!route.matchesDomain("example.org"));
-    try std.testing.expect(!route.matchesDomain("notcn"));
-}
-
-test "parseToml with dns routes" {
+test "parseToml ignores removed dns sections" {
     const allocator = std.testing.allocator;
     var config = try parseToml(allocator,
         \\[dns]
@@ -1737,12 +1540,8 @@ test "parseToml with dns routes" {
         \\domains = ["google.com"]
     );
     defer config.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 2), config.dns.route_count);
-    try std.testing.expectEqualStrings("119.29.29.29", config.dns.routes[0].getServer());
-    try std.testing.expectEqual(@as(u8, 2), config.dns.routes[0].suffix_count);
-    try std.testing.expect(config.dns.routes[0].matchesDomain("test.cn"));
-    try std.testing.expectEqualStrings("8.8.4.4", config.dns.routes[1].getServer());
-    try std.testing.expectEqual(@as(u32, 120), config.dns.min_ttl);
+    // No panic and unrelated config remains parseable.
+    try std.testing.expectEqual(@as(u16, 0), config.workers);
 }
 
 test "parseToml with listeners" {

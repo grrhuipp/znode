@@ -42,7 +42,8 @@ pub fn encodeFirstPacket(
     var enc_state = ss_crypto.StreamState.init(method, psk, salt[0..salt_size]);
 
     // Build plaintext: [address][initial payload]
-    var plain_buf: [4096]u8 = undefined;
+    // 8192 matches bufs.payload capacity; 4096 would silently truncate large payloads.
+    var plain_buf: [8192]u8 = undefined;
     const addr_len = ss_protocol.encodeAddress(target, &plain_buf) orelse return null;
 
     var plain_total = addr_len;

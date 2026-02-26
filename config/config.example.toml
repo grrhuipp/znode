@@ -4,18 +4,11 @@ log_level = "info"
 workers = 0
 log_dir = "logs"
 log_max_days = 30
-# log_clean_on_start = false  # delete all logs on startup
 
-# Geo databases (auto-downloaded from Loyalsoldier if missing)
-# geoip_path = "geoip.dat"
-# geosite_path = "geosite.dat"
-# geoip_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-# geosite_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-# geo_update_interval = 24  # hours, 0 = disabled
+# DNS note:
+# Runtime name resolution is unified to zio/system DNS (getaddrinfo).
+# Custom [dns] / [[dns.routes]] sections are no longer used.
 
-# Routes: auto-loaded from routes.toml in same directory (if exists)
-
-# ── Panel mode ──
 [[panel]]
 name = "jx"
 panel_type = "v2board"
@@ -23,42 +16,3 @@ api_url = "https://panel.example.com"
 api_key = "your-api-key-here"
 node_id = 1
 protocol = "trojan"
-listen = "0.0.0.0"
-tls = false
-# cert_file = "cert/server.crt"
-# key_file = "cert/server.key"
-# send_through = "192.168.1.100"  # bind outbound to specific local IP (default: auto)
-
-# ── Standalone listener mode ──
-# [[listeners]]
-# name = "trojan-in"
-# port = 443
-# protocol = "trojan"
-# tls = true
-# cert_file = "cert/server.crt"
-# key_file = "cert/server.key"
-# fallback_addr = "127.0.0.1"
-# fallback_port = 8080
-# send_through = "192.168.1.100"
-
-# [[listeners]]
-# name = "ss-in"
-# port = 8388
-# protocol = "shadowsocks"
-# password = "your-password"
-# method = "aes-256-gcm"
-
-# ── DNS ──
-[dns]
-# servers = ["8.8.8.8", "1.1.1.1"]
-# cache_size = 1024
-# min_ttl = 60
-# max_ttl = 3600
-
-# ── Limits ──
-[limits]
-max_connections = 0
-max_conn_per_ip = 0
-handshake_timeout_ms = 0
-relay_idle_timeout_ms = 0
-buffer_pool_max_mb = 0

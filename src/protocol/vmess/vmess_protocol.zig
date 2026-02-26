@@ -733,6 +733,126 @@ pub fn parseResponse(
     } };
 }
 
+// ── Streaming Parse Helpers ──
+
+/// Result of streaming step 1: user authenticated + header length decoded.
+/// Replay check is deferred to step 2 (after reading the full header).
+pub const StreamStep1Result = struct {
+    header_len: u16,
+    cmd_key: vmess_crypto.CmdKey,
+    auth_id: vmess_crypto.AuthID,
+    connection_nonce: [8]u8,
+    user: ?*const user_store.UserStore.UserInfo,
+};
+
+/// Streaming step 1: scan users + decode header length from the 42-byte preamble.
+/// Returns null if no user matches (auth failed).
+/// Call with replay_mutex held if hot_cache is shared.
+pub fn streamStep1(
+    preamble: *const [42]u8,
+    user_map: *const user_store.UserStore.UserMap,
+    hot_cache: ?*vmess_hot_cache.HotCache,
+    allocator: std.mem.Allocator,
+    now: i64,
+) ?StreamStep1Result {
+    const auth_id: vmess_crypto.AuthID = preamble[0..16].*;
+    const enc_length_block = preamble[16..34];
+    const connection_nonce: [8]u8 = preamble[34..42].*;
+
+    // Fast path: hot cache
+    if (hot_cache) |cache| {
+        if (cache.tryAuth(auth_id, now, allocator)) |hit| {
+            if (user_map.findById(hit.user_id)) |user| {
+                if (user.enabled) {
+                    if (tryPeekHeaderLen(enc_length_block, hit.cmd_key, auth_id, connection_nonce)) |header_len| {
+                        return .{ .header_len = header_len, .cmd_key = hit.cmd_key, .auth_id = auth_id, .connection_nonce = connection_nonce, .user = user };
+                    }
+                }
+            }
+            cache.evictUser(hit.user_id);
+        }
+    }
+
+    // Slow path: full user scan
+    for (user_map.users) |*user| {
+        if (!user.enabled) continue;
+        const auth_key = user.cached_auth_key;
+        _ = vmess_crypto.validateAuthId(auth_id, auth_key, now) orelse continue;
+        const cmd_key = user.cached_cmd_key;
+        if (tryPeekHeaderLen(enc_length_block, cmd_key, auth_id, connection_nonce)) |header_len| {
+            if (hot_cache) |cache| cache.recordAuth(user.id, cmd_key, auth_key, now, allocator);
+            return .{ .header_len = header_len, .cmd_key = cmd_key, .auth_id = auth_id, .connection_nonce = connection_nonce, .user = user };
+        }
+    }
+
+    return null;
+}
+
+/// Peek header length: decrypt only the 18-byte length block without consuming it.
+/// Returns null if GCM auth fails (wrong key).
+fn tryPeekHeaderLen(
+    enc_length_block: []const u8,
+    cmd_key: vmess_crypto.CmdKey,
+    auth_id: vmess_crypto.AuthID,
+    connection_nonce: [8]u8,
+) ?u16 {
+    const length_key = vmess_crypto.deriveHeaderLengthKey(cmd_key, auth_id, connection_nonce);
+    const length_nonce = vmess_crypto.deriveHeaderLengthNonce(cmd_key, auth_id, connection_nonce);
+
+    var length_plain: [2]u8 = undefined;
+    Aes128Gcm.decrypt(
+        &length_plain,
+        enc_length_block[0..2],
+        enc_length_block[2..18].*,
+        &auth_id,
+        length_nonce,
+        length_key,
+    ) catch return null;
+
+    return std.mem.readInt(u16, &length_plain, .big);
+}
+
+/// Streaming step 2: decrypt VMess header + replay check using step1 result.
+/// full_data must span bytes [0 .. 42 + step1.header_len + 16].
+/// Call with replay_mutex held.
+pub fn streamStep2(
+    full_data: []const u8,
+    step1: StreamStep1Result,
+    replay_filter: *ReplayFilter,
+    now: i64,
+) ParseResult {
+    const total_len: usize = 42 + @as(usize, step1.header_len) + 16;
+    if (full_data.len < total_len) return .incomplete;
+
+    const header_key = vmess_crypto.deriveHeaderKey(step1.cmd_key, step1.auth_id, step1.connection_nonce);
+    const header_nonce = vmess_crypto.deriveHeaderNonce(step1.cmd_key, step1.auth_id, step1.connection_nonce);
+
+    var header_plain: [512]u8 = undefined;
+    if (step1.header_len > header_plain.len) return .protocol_error;
+
+    const enc_header = full_data[42 .. 42 + step1.header_len];
+    const header_tag = full_data[42 + step1.header_len .. total_len];
+
+    Aes128Gcm.decrypt(
+        header_plain[0..step1.header_len],
+        enc_header,
+        header_tag[0..16].*,
+        &step1.auth_id,
+        header_nonce,
+        header_key,
+    ) catch return .protocol_error;
+
+    if (replay_filter.isDuplicate(step1.auth_id, now)) return .replay_detected;
+
+    return parseDecryptedHeader(
+        header_plain[0..step1.header_len],
+        total_len,
+        step1.cmd_key,
+        step1.connection_nonce,
+        step1.user,
+    );
+}
+
 // ── Tests ──
 
 const testing = std.testing;

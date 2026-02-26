@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 
 // ── Log Level (API unchanged) ──
 
@@ -40,6 +41,13 @@ pub fn getLevel() Level {
 
 pub fn isEnabled(level: Level) bool {
     return @intFromEnum(level) >= @intFromEnum(getLevel());
+}
+
+/// Enable console output on all log channels (access + error).
+/// App channel always writes to console; this enables it for the others too.
+pub fn setConsoleAll(enabled: bool) void {
+    g_state.access_ch.write_console = enabled;
+    g_state.error_ch.write_console = enabled;
 }
 
 fn levelStr(level: Level) []const u8 {
@@ -486,13 +494,17 @@ pub const ScopedLogger = struct {
         return .{ .worker_id = worker_id, .scope = scope, .batch = b };
     }
 
-    /// Set the client IP:port from a net.Address (IPv4 supported; IPv6 left as-is).
-    pub fn setClientIp(self: *ScopedLogger, addr: std.net.Address) void {
-        if (addr.any.family != 2) return; // AF_INET only
-        const ip_bytes: [4]u8 = @bitCast(addr.in.sa.addr);
-        const s = std.fmt.bufPrint(&self.src_buf, "{d}.{d}.{d}.{d}:{d}", .{
-            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], addr.getPort(),
-        }) catch return;
+    /// Set the client source from a zio.net.IpAddress (accept result).
+    pub fn setSource(self: *ScopedLogger, addr: zio.net.IpAddress) void {
+        const s = switch (addr.getFamily()) {
+            .ipv4 => blk: {
+                const ip_bytes: [4]u8 = @bitCast(addr.in.addr);
+                break :blk std.fmt.bufPrint(&self.src_buf, "{d}.{d}.{d}.{d}:{d}", .{
+                    ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], addr.getPort(),
+                }) catch return;
+            },
+            .ipv6 => std.fmt.bufPrint(&self.src_buf, "[ipv6]:{d}", .{addr.getPort()}) catch return,
+        };
         self.src_len = @intCast(s.len);
     }
 

@@ -77,39 +77,70 @@ static void sha3_keccakf(uint64_t st[25])
 //  SHAKE128 sponge — using tiny_sha3 absorb/squeeze
 // ══════════════════════════════════════════════════════════════
 
-void shake128(const uint8_t *input, size_t input_len,
-              uint8_t *output, size_t output_len) {
+void shake128_init(shake128_ctx *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+void shake128_update(shake128_ctx *ctx, const uint8_t *input, size_t input_len) {
     // SHAKE128: rate = 168 bytes (1344 bits), capacity = 256 bits
     const int rsiz = 168;
+    uint8_t *st = (uint8_t *)ctx->state_q;
+    int pt = (int)ctx->absorb_pos;
 
-    // State (200 bytes = 25 × 64-bit words)
-    union { uint8_t b[200]; uint64_t q[25]; } st;
-    memset(&st, 0, 200);
-
-    // Absorb (byte-level XOR into state, permute when full)
-    int pt = 0;
     for (size_t i = 0; i < input_len; i++) {
-        st.b[pt++] ^= input[i];
+        st[pt++] ^= input[i];
         if (pt >= rsiz) {
-            sha3_keccakf(st.q);
+            sha3_keccakf(ctx->state_q);
             pt = 0;
         }
     }
 
+    ctx->absorb_pos = (uint32_t)pt;
+}
+
+void shake128_finalize(shake128_ctx *ctx) {
+    if (ctx->finalized) {
+        return;
+    }
+
+    const int rsiz = 168;
+    uint8_t *st = (uint8_t *)ctx->state_q;
+
     // Finalize absorb: SHAKE domain separator (0x1F) + pad10*1
-    st.b[pt] ^= 0x1F;
-    st.b[rsiz - 1] ^= 0x80;
-    sha3_keccakf(st.q);
+    st[ctx->absorb_pos] ^= 0x1F;
+    st[rsiz - 1] ^= 0x80;
+    sha3_keccakf(ctx->state_q);
+    ctx->squeeze_pos = 0;
+    ctx->finalized = 1;
+}
+
+void shake128_read(shake128_ctx *ctx, uint8_t *output, size_t output_len) {
+    const int rsiz = 168;
+    uint8_t *st = (uint8_t *)ctx->state_q;
+
+    if (!ctx->finalized) {
+        shake128_finalize(ctx);
+    }
 
     // Squeeze
-    int j = 0;
+    int j = (int)ctx->squeeze_pos;
     for (size_t i = 0; i < output_len; i++) {
         if (j >= rsiz) {
-            sha3_keccakf(st.q);
+            sha3_keccakf(ctx->state_q);
+            st = (uint8_t *)ctx->state_q;
             j = 0;
         }
-        output[i] = st.b[j++];
+        output[i] = st[j++];
     }
+    ctx->squeeze_pos = (uint32_t)j;
+}
+
+void shake128(const uint8_t *input, size_t input_len,
+              uint8_t *output, size_t output_len) {
+    shake128_ctx ctx;
+    shake128_init(&ctx);
+    shake128_update(&ctx, input, input_len);
+    shake128_read(&ctx, output, output_len);
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -4,9 +4,9 @@
     .fingerprint = 0xd17b382a0effa5f3,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
-        .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
+        .zio = .{
+            .url = "https://github.com/lalinsky/zio/archive/refs/tags/v0.8.2.tar.gz",
+            .hash = "zio-0.8.2-xHbVVC5jGAAYUMZd_BW5eT-HJb_lf-LCGj4PaLOeEkA2",
         },
     },
     .paths = .{

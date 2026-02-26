@@ -131,6 +131,23 @@ pub const StreamState = struct {
         return frame_size;
     }
 
+    /// Peek at the payload length encoded in the 18-byte encrypted length block,
+    /// WITHOUT advancing the nonce counter.
+    /// Returns null if AEAD authentication fails (integrity_error).
+    pub fn peekPayloadLen(self: *const StreamState, header: *const [18]u8) ?u16 {
+        const key_len = self.method.keySize();
+        const key = self.subkey[0..key_len];
+
+        var len_plain: [2]u8 = undefined;
+        var len_tag: [16]u8 = undefined;
+        @memcpy(&len_tag, header[2..18]);
+        if (!self.decrypt(header[0..2], len_tag, &len_plain, key)) return null;
+
+        const payload_len = std.mem.readInt(u16, &len_plain, .big);
+        if (payload_len > max_payload_size) return null;
+        return payload_len;
+    }
+
     /// Decrypt a Shadowsocks AEAD frame from the buffer.
     /// Returns DecryptResult indicating success (with lengths) or need-more-data.
     pub fn decryptFrame(self: *StreamState, data: []const u8, out: []u8) DecryptResult {

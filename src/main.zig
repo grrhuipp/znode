@@ -1,9 +1,16 @@
 const std = @import("std");
-const xev = @import("xev");
+const builtin = @import("builtin");
+const zio = @import("zio");
 const log = @import("core/log.zig");
+
+// Suppress zio debug logs (poll timeouts, APC, worker thread spawn, etc.)
+pub const std_options = std.Options{
+    .log_level = .warn,
+};
 const config_mod = @import("core/config.zig");
 const Worker = @import("core/worker.zig").Worker;
 const Dispatcher = @import("core/dispatcher.zig").Dispatcher;
+const session_handler = @import("core/session_handler.zig");
 const stats_mod = @import("core/stats.zig");
 const api_client_mod = @import("panel/api_client.zig");
 const self_signed = @import("transport/self_signed.zig");
@@ -12,13 +19,11 @@ const tls_init = @import("transport/tls_init.zig");
 const user_store_mod = @import("core/user_store.zig");
 const traffic_collector_mod = @import("panel/traffic_collector.zig");
 const panel_manager_mod = @import("panel/panel_manager.zig");
-const dns_resolver_mod = @import("dns/resolver.zig");
 const router_mod = @import("router/router.zig");
 const geoip_mod = @import("geo/geoip.zig");
 const geosite_mod = @import("geo/geosite.zig");
 const geo_updater_mod = @import("geo/geo_updater.zig");
 const trojan = @import("protocol/trojan/trojan_protocol.zig");
-const vmess_hot_cache = @import("protocol/vmess/vmess_hot_cache.zig");
 const ss_crypto = @import("protocol/shadowsocks/ss_crypto.zig");
 
 // ── Global allocator (too large for stack on Windows) ──
@@ -41,7 +46,6 @@ const PanelBootstrap = struct {
     tc: *traffic_collector_mod.TrafficCollector,
     entry: *const config_mod.NodeConfig,
     panel_idx: u8,
-    hot_cache_ttl: u32 = 0,
     dispatcher: *Dispatcher = undefined,
     allocator: std.mem.Allocator = undefined,
 
@@ -57,46 +61,6 @@ const PanelBootstrap = struct {
 /// Global retry thread control (single thread retries all failed panels).
 var g_retry_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
 var g_retry_thread: ?std.Thread = null;
-
-// ── Shutdown signal handling ──
-
-var g_dispatcher: ?*Dispatcher = null;
-var g_shutdown_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-
-fn handleShutdownSignal() void {
-    const count = g_shutdown_count.fetchAdd(1, .monotonic);
-    if (count >= 1) {
-        // Second signal: force exit immediately
-        log.info("forced exit", .{});
-        std.process.exit(0);
-    }
-    log.info("shutdown signal received", .{});
-    if (g_dispatcher) |d| d.stop();
-}
-
-const shutdown_impl = if (@import("builtin").os.tag == .windows) struct {
-    const windows = std.os.windows;
-
-    fn ctrlHandler(ctrl_type: windows.DWORD) callconv(.winapi) windows.BOOL {
-        // CTRL_C_EVENT = 0, CTRL_CLOSE_EVENT = 2
-        if (ctrl_type == 0 or ctrl_type == 2) {
-            handleShutdownSignal();
-            return 1; // TRUE — handled
-        }
-        return 0;
-    }
-
-    fn register() void {
-        _ = windows.kernel32.SetConsoleCtrlHandler(@ptrCast(&ctrlHandler), 1);
-    }
-} else struct {
-    // POSIX signal handling (Linux/macOS)
-    fn register() void {
-        // On POSIX, the event loop interruption from SIGINT/SIGTERM
-        // will cause loop.run() to return. No explicit handler needed
-        // beyond the default behavior.
-    }
-};
 
 pub fn main() void {
     appMain() catch |e| {
@@ -149,12 +113,14 @@ fn appMain() !void {
     defer config.deinit(allocator);
 
     log.setLevel(config.log_level);
+    if (config.log_console) log.setConsoleAll(true);
     if (config.log_dir_len > 0) {
         log.init(config.log_dir[0..config.log_dir_len], config.log_max_days, config.log_clean_on_start);
     }
     defer log.shutdown();
     defer tls_init.deinitDynamicCert(allocator);
     log.info("znode proxy server starting", .{});
+    try preflightBackend();
 
     const worker_count = config.getWorkerCount();
     log.info("worker count: {d}", .{worker_count});
@@ -189,27 +155,15 @@ fn appMain() !void {
         }
     };
 
-    // Async DNS resolver (shared by all workers, runs on dedicated thread)
-    var dns_async = dns_resolver_mod.AsyncResolver.init(
-        allocator,
-        config.dns.servers,
-        config.dns.cache_size,
-        config.dns.min_ttl,
-        config.dns.max_ttl,
-    );
-    if (config.dns.route_count > 0) {
-        dns_async.dns_routes = config.dns.routes[0..config.dns.route_count];
-        log.info("DNS: {d} routing rules configured", .{config.dns.route_count});
-    }
-    defer dns_async.deinit();
-    try dns_async.start();
-    // NOTE: dns_async.stop()/join() is done explicitly in the shutdown
-    // section below (before workers.deinit) to avoid use-after-free
-    // on worker.async_notify. See shutdown comment for details.
+    // Listener info storage (shared by dispatcher and session handlers)
+    // All listeners' config stored in a single canonical array (replaces per-worker copies)
+    const listener_infos = try allocator.create([config_mod.max_listeners]Worker.ListenerInfo);
+    defer allocator.destroy(listener_infos);
+    listener_infos.* = [_]Worker.ListenerInfo{.{}} ** config_mod.max_listeners;
+    var listener_info_count: u8 = 0;
 
-    // Create workers (heap-allocated array)
-    const workers = try allocator.alloc(Worker, worker_count);
-    defer allocator.free(workers);
+    // Workers are no longer needed (sessions run as zio coroutines).
+    // Worker.ListenerInfo type is still used for listener config storage.
 
     // Initialize geo databases (auto-download if missing)
     var geoip = geoip_mod.GeoIP.init(allocator);
@@ -234,54 +188,20 @@ fn appMain() !void {
         log.info("routes: {d} entries", .{config.routes.len});
     }
 
-    // Initialize workers with global shared context
-    for (workers, 0..) |*w, i| {
-        w.* = try Worker.init(@intCast(i), allocator);
-        // Wire batch pointer AFTER Worker is in its final heap location
-        w.logger = log.ScopedLogger.withBatch(w.id, "worker", &w.log_batch);
-        w.logger.to_app = true;
-        w.log_batch.to_app = true;
-        w.dns_resolver = &dns_async;
-        w.router = &router;
-        w.handshake_timeout_ms = config.limits.handshake_timeout_ms;
-        w.idle_timeout_ms = config.limits.relay_idle_timeout_ms;
-        w.half_close_grace_ms = config.limits.half_close_grace_ms;
-    }
     defer {
-        // Stop and join workers before deinit in ALL exit paths (including error returns).
-        // Without this, an early error return (e.g. from try w.spawn() or try dispatcher.run())
-        // causes deinit() to close the epoll fd while the worker thread is still running →
-        // epoll_wait returns EBADF → unreachable → panic in ReleaseSafe builds.
-        // stop() and join() are idempotent: if the normal shutdown path already called them
-        // (lines below), join() finds thread == null and returns immediately.
-        for (workers) |*w| w.stop();
-        for (workers) |*w| w.join();
-        for (workers) |*w| w.deinit();
+        // Deinit hot caches stored in canonical listener_infos
+        for (listener_infos[0..listener_info_count]) |*info| {
+            info.hot_cache.deinit(allocator);
+        }
     }
 
-    // Create dispatcher (heap-allocated — contains xev.Loop which is large on Windows)
+    // Create dispatcher (heap-allocated — contains server arrays)
     const dispatcher = try allocator.create(Dispatcher);
     defer allocator.destroy(dispatcher);
-    try dispatcher.initInPlace(workers, allocator);
+    dispatcher.* = Dispatcher.init(listener_infos, &listener_info_count, allocator);
     defer dispatcher.deinit();
 
-    // Configure dispatch strategy
-    const AffinityTable = @import("core/affinity.zig").AffinityTable;
-    dispatcher.strategy = config.limits.dispatch_strategy;
-    if (dispatcher.strategy == .ip_hash) {
-        dispatcher.affinity = try allocator.create(AffinityTable);
-        dispatcher.affinity.?.* = AffinityTable{};
-    }
-    defer if (dispatcher.affinity) |a| allocator.destroy(a);
-    if (dispatcher.strategy == .random) {
-        dispatcher.prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-    }
-    log.info("dispatch strategy: {s}", .{@tagName(config.limits.dispatch_strategy)});
-
-    // Register shutdown signal handler
-    g_dispatcher = dispatcher;
-    shutdown_impl.register();
-    defer g_dispatcher = null;
+    // Shutdown signal handling is now inside dispatcher.run() via zio.Signal
 
     // ── Panel setup: all HTTP moved to background (prevents startup hang) ──
     var bootstraps: [max_panels]PanelBootstrap = undefined;
@@ -323,7 +243,6 @@ fn appMain() !void {
             .tc = tc,
             .entry = entry,
             .panel_idx = idx,
-            .hot_cache_ttl = config.limits.vmess_hot_cache_ttl,
             .dispatcher = dispatcher,
             .allocator = allocator,
         };
@@ -419,10 +338,6 @@ fn appMain() !void {
                     log.info("listener shadowsocks: method={s}", .{lc.getSsMethod()});
                 }
             }
-            // Configure per-listener VMess hot cache TTL
-            if (lc.protocol == .vmess and config.limits.vmess_hot_cache_ttl > 0) {
-                info.hot_cache = vmess_hot_cache.HotCache.init(@intCast(config.limits.vmess_hot_cache_ttl));
-            }
             // Routing + Transport + WebSocket path
             info.enable_routing = lc.enable_routing;
             info.transport = lc.transport;
@@ -454,10 +369,9 @@ fn appMain() !void {
                 }
             }
 
-            for (workers) |*w| {
-                w.listener_infos[lid] = info;
-                w.listener_info_count = @max(w.listener_info_count, lid + 1);
-            }
+            // Store in canonical listener_infos (read by session handler)
+            listener_infos[lid] = info;
+            listener_info_count = @max(listener_info_count, lid + 1);
 
             log.info("listener: {s}:{d} ({s}{s}{s})", .{
                 lc.getListenAddr(),
@@ -482,11 +396,6 @@ fn appMain() !void {
         log.info("znode ready, {d} panel(s) starting in background, press Ctrl+C to stop", .{bootstrap_count});
     }
 
-    // Start worker threads (after all listeners are configured)
-    for (workers) |*w| {
-        try w.spawn();
-    }
-
     // Start geo database auto-updater (background thread, periodic refresh)
     if (config.geo_update_interval > 0) {
         geo_updater.start() catch |e| {
@@ -494,7 +403,25 @@ fn appMain() !void {
         };
     }
 
-    // Run dispatcher on main thread (blocks until stop)
+    // Create shared session context (thread-safe, used by all session coroutines)
+    var shared = session_handler.Shared{
+        .allocator = allocator,
+        .router = &router,
+        .buf_pool = session_handler.BufPool.init(allocator),
+    };
+    // Drain cached session buffers before allocator teardown.
+    // Keep this defer above rt.deinit so runtime shutdown runs first.
+    defer shared.buf_pool.deinit();
+    dispatcher.shared = &shared;
+
+    // Initialize zio runtime with N executors (= worker_count, replaces xev worker threads)
+    const rt = try zio.Runtime.init(allocator, .{
+        .executors = .exact(@intCast(worker_count)),
+    });
+    defer rt.deinit();
+
+    // Run dispatcher (blocks until Ctrl+C via zio.Signal)
+    log.info("starting with {d} executor(s)", .{worker_count});
     try dispatcher.run();
 
     // ── Shutdown ──
@@ -503,13 +430,6 @@ fn appMain() !void {
     // Stop geo updater first (independent background thread)
     geo_updater.stop();
 
-    // Stop DNS thread BEFORE workers — DNS callbacks access worker.async_notify.
-    // If workers deinit first, DNS callbacks would use-after-free on async_notify.
-    dns_async.stop();
-    dns_async.join();
-
-    for (workers) |*w| w.stop();
-    for (workers) |*w| w.join();
     log.info("znode stopped", .{});
 }
 
@@ -519,7 +439,6 @@ fn buildWorkerListenerInfo(
     server_info: api_client_mod.ServerNodeInfo,
     panel_tls_ctx: ?*tls_mod.TlsContext,
     store: *user_store_mod.UserStore,
-    hot_cache_ttl: u32,
     panel_idx: u8,
 ) Worker.ListenerInfo {
     const listen_port = server_info.server_port;
@@ -566,9 +485,6 @@ fn buildWorkerListenerInfo(
                 .key_len = @intCast(method.keySize()),
             };
         }
-    }
-    if (entry.protocol == .vmess and hot_cache_ttl > 0) {
-        info.hot_cache = vmess_hot_cache.HotCache.init(@intCast(hot_cache_ttl));
     }
     return info;
 }
@@ -659,7 +575,7 @@ fn panelSetupOne(b: *PanelBootstrap, attempt: u32) void {
     }
 
     const worker_info = buildWorkerListenerInfo(
-        b.entry, server_info, panel_tls_ctx, b.store, b.hot_cache_ttl, b.panel_idx,
+        b.entry, server_info, panel_tls_ctx, b.store, b.panel_idx,
     );
     b.dispatcher.listenLive(b.entry.getListenAddr(), server_info.server_port, worker_info) catch |e| {
         log.err("panel[{d}] {s}: listenLive failed: {}", .{ b.panel_idx, name, e });
@@ -711,19 +627,37 @@ fn parseIpv4(s: []const u8, out: *[4]u8) bool {
     return true;
 }
 
+/// Startup backend preflight.
+/// On Linux with io_uring backend, verify the event loop can initialize.
+fn preflightBackend() !void {
+    if (builtin.os.tag != .linux) return;
+
+    log.info("zio backend: {s}", .{@tagName(zio.ev.backend)});
+
+    if (zio.ev.backend != .io_uring) return;
+
+    var loop: zio.ev.Loop = undefined;
+    loop.init(.{
+        .allocator = std.heap.page_allocator,
+    }) catch |err| {
+        log.err("io_uring preflight failed: {s}", .{@errorName(err)});
+        log.err("hint: rebuild with epoll backend (set zio backend to epoll in build.zig)", .{});
+        return err;
+    };
+    loop.deinit();
+}
+
 // ── Module imports for tests ──
 test {
     _ = @import("core/errors.zig");
     _ = @import("core/log.zig");
     _ = @import("core/config.zig");
     _ = @import("core/stats.zig");
-    _ = @import("core/buffer_pool.zig");
+    _ = @import("core/buf_pool.zig");
     _ = @import("core/affinity.zig");
     _ = @import("core/session.zig");
     _ = @import("core/user_store.zig");
     _ = @import("transport/stream.zig");
-    _ = @import("dns/cache.zig");
-    _ = @import("dns/resolver.zig");
     _ = @import("geo/protobuf_lite.zig");
     _ = @import("geo/geoip.zig");
     _ = @import("geo/geosite.zig");
@@ -735,7 +669,6 @@ test {
     _ = @import("transport/tls_stream.zig");
     _ = @import("transport/self_signed.zig");
     _ = @import("transport/ws_stream.zig");
-    _ = @import("core/connection_fsm.zig");
     _ = @import("protocol/trojan/trojan_protocol.zig");
     _ = @import("protocol/vmess/vmess_crypto.zig");
     _ = @import("protocol/vmess/vmess_hot_cache.zig");
@@ -743,15 +676,12 @@ test {
     _ = @import("protocol/vmess/vmess_stream.zig");
     _ = @import("protocol/vmess/xudp_mux.zig");
     _ = @import("udp/udp_packet.zig");
-    _ = @import("udp/udp_session.zig");
-    _ = @import("udp/udp_relay.zig");
     _ = @import("core/rate_limiter.zig");
     _ = @import("core/conn_limiter.zig");
     _ = @import("panel/api_client.zig");
     _ = @import("panel/traffic_collector.zig");
     _ = @import("panel/panel_manager.zig");
     _ = @import("core/worker.zig");
-    _ = @import("core/proxy_connection.zig");
     _ = @import("core/dispatcher.zig");
     _ = @import("protocol/shadowsocks/ss_crypto.zig");
     _ = @import("protocol/shadowsocks/ss_protocol.zig");
@@ -761,8 +691,6 @@ test {
     _ = @import("protocol/trojan/trojan_outbound.zig");
     _ = @import("protocol/vmess/vmess_inbound.zig");
     _ = @import("protocol/vmess/vmess_outbound.zig");
-    _ = @import("transport/outbound_transport.zig");
     _ = @import("geo/geo_updater.zig");
     _ = @import("transport/dynamic_cert.zig");
 }
-

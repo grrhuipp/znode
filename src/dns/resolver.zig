@@ -99,8 +99,14 @@ pub const Resolver = struct {
         defer std.posix.close(sock);
 
         // Set timeout (2 seconds)
-        const timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        // Windows SO_RCVTIMEO takes DWORD (milliseconds), POSIX takes timeval
+        if (builtin.os.tag == .windows) {
+            const timeout_ms: u32 = 2000;
+            std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms)) catch {};
+        } else {
+            const timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        }
 
         _ = std.posix.sendto(sock, query_buf[0..query_len], 0, &addr.any, addr.getOsSockLen()) catch
             return error.DnsSendFailed;

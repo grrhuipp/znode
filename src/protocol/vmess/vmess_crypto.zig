@@ -254,33 +254,35 @@ pub fn fnv1a32(data: []const u8) [4]u8 {
     return result;
 }
 
-/// ShakeMask: 4KB one-shot SHAKE128 buffer with circular reuse.
-/// Matches acppnode's ShakeMask implementation exactly.
+/// ShakeMask: 4KB refill buffer over a continuous SHAKE128 stream.
 pub const ShakeMask = struct {
     buffer: [shake_mask_buffer_size]u8 = undefined,
     offset: usize = 0,
     initialized: bool = false,
-    nonce: [16]u8,
+    shake: Shake128,
 
     pub fn init(nonce: [16]u8) ShakeMask {
-        return .{ .nonce = nonce };
+        var shake = Shake128.init(.{});
+        shake.update(&nonce);
+        return .{ .shake = shake };
+    }
+
+    fn refill(self: *ShakeMask) void {
+        self.shake.squeeze(&self.buffer);
+        self.offset = 0;
+        self.initialized = true;
     }
 
     fn ensureInitialized(self: *ShakeMask) void {
-        if (self.initialized) return;
-        // One-shot: generate 4KB of SHAKE128 output from nonce
-        var shake = Shake128.init(.{});
-        shake.update(&self.nonce);
-        shake.squeeze(&self.buffer);
-        self.initialized = true;
+        if (!self.initialized) self.refill();
     }
 
     /// Get next 2-byte mask value (big-endian).
     pub fn nextMask(self: *ShakeMask) u16 {
         self.ensureInitialized();
-        // Circular: wrap around at buffer boundary
+        // Refill from the SHAKE stream when the current 4KB block is exhausted.
         if (self.offset + 2 > shake_mask_buffer_size) {
-            self.offset = 0;
+            self.refill();
         }
         const result = (@as(u16, self.buffer[self.offset]) << 8) |
             @as(u16, self.buffer[self.offset + 1]);
@@ -818,7 +820,7 @@ test "ShakeMask buffer is SHAKE128 of 16-byte nonce" {
     try std.testing.expectEqual(expected_m2, m2);
 }
 
-test "ShakeMask circular wrap at 4096 boundary" {
+test "ShakeMask refill at 4096 boundary continues stream" {
     const nonce = [_]u8{0x42} ** 16;
     var mask = ShakeMask.init(nonce);
 
@@ -827,14 +829,17 @@ test "ShakeMask circular wrap at 4096 boundary" {
         _ = mask.nextMask();
     }
 
-    // After consuming all values, offset = 4096. Next call wraps to 0.
+    // After consuming all values, offset = 4096. Next call refills the next block.
     try std.testing.expectEqual(@as(usize, 4096), mask.offset);
-    const after_wrap = mask.nextMask();
+    const after_refill = mask.nextMask();
 
-    // Should equal the first mask value (wrapped back to offset 0)
-    var fresh = ShakeMask.init(nonce);
-    const first = fresh.nextMask();
-    try std.testing.expectEqual(first, after_wrap);
+    // Expected value = bytes[4096..4098] from the SHAKE stream.
+    var shake = Shake128.init(.{});
+    shake.update(&nonce);
+    var stream_bytes: [4098]u8 = undefined;
+    shake.squeeze(&stream_bytes);
+    const expected = (@as(u16, stream_bytes[4096]) << 8) | @as(u16, stream_bytes[4097]);
+    try std.testing.expectEqual(expected, after_refill);
 
     // Offset should now be 2 (read 2 bytes from start)
     try std.testing.expectEqual(@as(usize, 2), mask.offset);

@@ -38,6 +38,10 @@ pub const ConnectAction = struct {
     // Initial payload length — data written to payload_out buffer by handler
     payload_len: u16 = 0,
 
+    // Set true when initial payload is already plaintext (e.g. SS streaming parse
+    // decrypts the first AEAD frame itself; session_handler must skip re-decryption).
+    payload_is_decrypted: bool = false,
+
     // VMess: response header to send before connecting (triggers deferred connect)
     response_buf: [64]u8 = undefined,
     response_len: u8 = 0,
@@ -55,4 +59,10 @@ pub const ConnectAction = struct {
         @memcpy(self.proto_label_buf[0..n], label[0..n]);
         self.proto_label_len = n;
     }
+};
+
+/// Result of streaming protocol parse — action + whether client requested UDP.
+pub const ParsedAction = struct {
+    action: ConnectAction,
+    is_udp: bool,
 };

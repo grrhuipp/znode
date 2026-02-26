@@ -9,6 +9,19 @@
 
 // ── SHAKE128 (Keccak XOF) ──
 // Absorbs `input_len` bytes, squeezes `output_len` bytes.
+typedef struct {
+    uint64_t state_q[25];
+    uint32_t absorb_pos;
+    uint32_t squeeze_pos;
+    uint8_t finalized;
+} shake128_ctx;
+
+void shake128_init(shake128_ctx *ctx);
+void shake128_update(shake128_ctx *ctx, const uint8_t *input, size_t input_len);
+void shake128_finalize(shake128_ctx *ctx);
+void shake128_read(shake128_ctx *ctx, uint8_t *output, size_t output_len);
+
+// One-shot helper (equivalent to init+update+read).
 void shake128(const uint8_t *input, size_t input_len,
               uint8_t *output, size_t output_len);
 

@@ -1,15 +1,15 @@
 // ══════════════════════════════════════════════════════════════
 //  Shared Connection Types
 //
-//  Standalone type definitions used by both proxy_connection.zig
-//  and sub-struct files. Placed here to break circular imports.
+//  Type definitions shared between protocol parsers and
+//  session handler vtable interfaces.
 // ══════════════════════════════════════════════════════════════
 
 const vmess_stream = @import("../protocol/vmess/vmess_stream.zig");
 const ss_crypto = @import("../protocol/shadowsocks/ss_crypto.zig");
-const ws_mod = @import("../transport/ws_stream.zig");
 
 /// Inbound protocol state — exactly one is active per connection.
+/// Used by InboundHandler.codecs() to extract codec pairs.
 pub const InboundProtocol = union(enum) {
     none: void,
     vmess: struct {
@@ -22,9 +22,6 @@ pub const InboundProtocol = union(enum) {
         encrypt_state: ss_crypto.StreamState, // server → client encrypt
     },
 };
-
-/// Outbound protocol kind — mutually exclusive.
-pub const OutboundKind = enum { direct, vmess, trojan, shadowsocks };
 
 /// Reason a connection was closed — logged in the close summary.
 pub const CloseReason = enum(u8) {
@@ -55,23 +52,4 @@ pub const CloseReason = enum(u8) {
             .err => "err",
         };
     }
-};
-
-/// Inbound WebSocket frame parsing state for relay phase.
-/// Tracks partial frames across TCP reads (client→server: masked per RFC 6455).
-pub const InboundWsState = struct {
-    frame_remaining: u32 = 0, // payload bytes remaining in current WS frame
-    mask_key: [4]u8 = .{ 0, 0, 0, 0 }, // current frame mask
-    mask_offset: u32 = 0, // mask position within frame (for partial reads)
-    header_buf: [14]u8 = undefined, // partial frame header accumulation (max: 2+8+4=14)
-    header_len: u8 = 0,
-    ctrl_skip: u32 = 0, // control frame payload bytes to skip
-    pong_buf: [140]u8 = undefined, // pending pong frame (6 header + 125 payload max, unmasked)
-    pong_len: u8 = 0,
-    accum_len: usize = 0, // WS accumulation buffer length (protocol_parse: target_buf)
-    // Streaming relay state
-    ctrl_is_ping: bool = false, // currently skipping a ping frame's payload
-    ping_payload: [125]u8 = undefined, // ping payload accumulation (for pong response)
-    ping_len: u8 = 0,
-    close_received: bool = false, // WS close frame received
 };

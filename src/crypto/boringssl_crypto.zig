@@ -367,21 +367,20 @@ pub const random = struct {
 
 /// SHAKE128 XOF — drop-in replacement for std.crypto.hash.sha3.Shake128.
 pub const Shake128 = struct {
-    /// Accumulated input (absorb phase). Fixed 16-byte buffer suffices for VMess usage.
-    nonce: [16]u8 = undefined,
-    nonce_len: usize = 0,
+    ctx: c.shake128_ctx = undefined,
 
     pub fn init(_: struct {}) Shake128 {
-        return .{};
+        var self = Shake128{};
+        c.shake128_init(&self.ctx);
+        return self;
     }
 
     pub fn update(self: *Shake128, data: []const u8) void {
-        @memcpy(self.nonce[self.nonce_len..][0..data.len], data);
-        self.nonce_len += data.len;
+        c.shake128_update(&self.ctx, data.ptr, data.len);
     }
 
     pub fn squeeze(self: *Shake128, out: []u8) void {
-        c.shake128(self.nonce[0..self.nonce_len].ptr, self.nonce_len, out.ptr, out.len);
+        c.shake128_read(&self.ctx, out.ptr, out.len);
     }
 };
 
@@ -568,6 +567,24 @@ test "Shake128 squeeze deterministic" {
     try testing.expectEqual(out1, out2);
     // Not all zeros
     try testing.expect(out1[0] != 0 or out1[1] != 0);
+}
+
+test "Shake128 squeeze is streaming" {
+    var s = Shake128.init(.{});
+    s.update(&([_]u8{0xAB} ** 16));
+
+    var part1: [32]u8 = undefined;
+    var part2: [32]u8 = undefined;
+    s.squeeze(&part1);
+    s.squeeze(&part2);
+
+    var one_shot = Shake128.init(.{});
+    one_shot.update(&([_]u8{0xAB} ** 16));
+    var combined: [64]u8 = undefined;
+    one_shot.squeeze(&combined);
+
+    try testing.expectEqualSlices(u8, &part1, combined[0..32]);
+    try testing.expectEqualSlices(u8, &part2, combined[32..64]);
 }
 
 test "Shake128 4KB squeeze" {
