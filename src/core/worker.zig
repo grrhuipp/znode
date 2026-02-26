@@ -57,6 +57,7 @@ pub const Worker = struct {
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     conns_relay: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // connections in relay/half_close/udp_relay phase
     conns_outbound: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // connections with target TCP established
+    leaked_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // sessions force-destroyed via LEAK_DETECT
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     close_counter: u32 = 0,

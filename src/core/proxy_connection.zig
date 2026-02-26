@@ -251,6 +251,12 @@ fn socketShutdownSend(fd: std.posix.fd_t) void {
     }
 }
 
+/// Platform-specific forced fd close.
+/// Used by forceDestroyLeaked to close sockets that the normal xev close path missed.
+fn forceCloseFd(fd: std.posix.fd_t) void {
+    std.posix.close(fd); // Zig 0.15.2: returns void on all platforms
+}
+
 /// Session: handles the full lifecycle of an inbound connection.
 ///
 /// Pipeline: TCP accept → [TLS handshake] → Protocol parse → DNS resolve → TCP connect → Relay
@@ -433,6 +439,7 @@ pub const Session = struct {
     }
 
     pub fn start(self: *Session, loop: *xev.Loop) void {
+        self.cached_loop = loop; // cache for emergency cleanup in LEAK_DETECT
         self.startTimeoutTimer(loop);
         self.startClientRead(loop);
     }
@@ -455,11 +462,9 @@ pub const Session = struct {
                 self.lifecycle.close_count,
                 self.lifecycle.sockets_to_close,
             });
-            // If FSM is already closed, this is likely a late callback after force-drain.
-            // Destroy to prevent leak; the session memory is still valid at this point.
-            if (self.lifecycle.fsm.isClosed()) {
-                self.destroy();
-            }
+            // Force cleanup to prevent fd/session leak regardless of FSM state.
+            // This is a safety net for double-opDone bugs — the session is stuck.
+            self.forceDestroyLeaked();
             return;
         }
         self.lifecycle.pending_ops -= 1;
@@ -481,7 +486,10 @@ pub const Session = struct {
         if (self.lifecycle.pending_ops == 0 and self.lifecycle.fsm.isClosed()) {
             self.destroy();
         } else if (self.lifecycle.pending_ops == 0 and !self.lifecycle.fsm.isClosed()) {
-            // LEAK DETECTOR: pending_ops reached 0 but session isn't closed — stuck session
+            // LEAK DETECTOR: pending_ops reached 0 but session isn't closed — stuck session.
+            // This can happen due to xev dup-fd callback races, timer cancel timing,
+            // or pending_ops accounting edge cases. Previously this only logged,
+            // causing the session + all its socket fds to leak forever.
             self.cfg.logger.warn("#{d} LEAK_DETECT pending_ops=0 but state={s} close_count={d}/{d} reason={s}", .{
                 self.metrics.conn_id,
                 self.lifecycle.fsm.state.name(),
@@ -489,6 +497,7 @@ pub const Session = struct {
                 self.lifecycle.sockets_to_close,
                 @tagName(self.lifecycle.close_reason),
             });
+            self.forceDestroyLeaked();
         }
     }
 
@@ -560,6 +569,77 @@ pub const Session = struct {
             self.inbound.protocol_buf = null;
             self.inbound.protocol_buf_len = 0;
         }
+    }
+
+    /// Emergency cleanup for leaked sessions: force-close ALL socket fds (including
+    /// xev dup'd fds on epoll) and destroy the session. Called when pending_ops hits 0
+    /// without the normal close path completing (LEAK_DETECT / underflow).
+    ///
+    /// This is a safety net — the normal path (initiateClose → drain → queueTcpClose →
+    /// onCloseComplete → destroy) should handle all closes. But if pending_ops accounting
+    /// goes wrong due to xev callback races or timer cancel edge cases, this prevents
+    /// socket fd leaks that would consume kernel memory indefinitely.
+    fn forceDestroyLeaked(self: *Session) void {
+        self.cfg.logger.err("#{d} [session] FORCE_DESTROY_LEAKED state={s} close_count={d}/{d}", .{
+            self.metrics.conn_id,
+            self.lifecycle.fsm.state.name(),
+            self.lifecycle.close_count,
+            self.lifecycle.sockets_to_close,
+        });
+        _ = self.cfg.worker.leaked_sessions.fetchAdd(1, .monotonic);
+
+        // Force-close any xev dup'd fds still registered in epoll.
+        // Normal drain/disarm should have closed these, but if pending_ops
+        // went wrong, some dup'd fds may still be open (keeping the socket alive
+        // even after we close the original fd).
+        if (comptime xev.backend == .epoll) {
+            const comps = [_]*xev.Completion{
+                &self.inbound.read_comp,
+                &self.inbound.write_comp,
+                &self.outbound.read_comp,
+                &self.outbound.write_comp,
+                &self.outbound.connect_comp,
+            };
+            for (comps) |comp| {
+                if (comp.flags.dup and comp.flags.dup_fd > 0) {
+                    const linux = std.os.linux;
+                    if (self.cached_loop) |l| {
+                        std.posix.epoll_ctl(l.fd, linux.EPOLL.CTL_DEL, comp.flags.dup_fd, null) catch {};
+                    }
+                    std.posix.close(comp.flags.dup_fd);
+                    comp.flags.dup_fd = 0;
+                }
+                // Mark dead to prevent xev from processing this completion
+                if (comp.flags.state == .active) {
+                    comp.flags.state = .dead;
+                    if (self.cached_loop) |l| l.active -|= 1;
+                } else if (comp.flags.state == .adding) {
+                    comp.flags.state = .dead;
+                }
+            }
+        }
+
+        // Force-close original socket fds directly (bypassing xev).
+        if (!self.lifecycle.fsm.isClosed()) {
+            forceCloseFd(self.inbound.tcp.fd);
+            if (self.outbound.tcp) |tcp| forceCloseFd(tcp.fd);
+        }
+
+        // Decrement outbound counter if we had an outbound socket that wasn't
+        // decremented during initiateClose (e.g., if initiateClose never ran).
+        if (self.outbound.tcp != null and !self.lifecycle.fsm.isClosingOrClosed()) {
+            _ = self.cfg.worker.conns_outbound.fetchSub(1, .monotonic);
+        }
+
+        // Ensure FSM reaches terminal state for destroy()
+        if (!self.lifecycle.fsm.isClosed()) {
+            if (!self.lifecycle.fsm.isClosingOrClosed()) {
+                self.lifecycle.fsm.transitionToClosing();
+            }
+            self.lifecycle.fsm.transitionToClosed();
+        }
+
+        self.destroy();
     }
 
     fn destroy(self: *Session) void {
