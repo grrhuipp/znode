@@ -1,0 +1,25 @@
+# Route configuration (soga-style: rules + inline outbounds)
+
+[[routes]]
+rules = ["geosite:netflix", "domain:google.com"]
+
+[[routes.outs]]
+type = "vmess"
+server = "1.2.3.4"
+port = 443
+uuid = "550e8400-e29b-41d4-a716-446655440000"
+security = "aes-128-gcm"
+tls = true
+sni = "example.com"
+
+[[routes]]
+rules = ["geoip:cn"]
+
+[[routes.outs]]
+type = "direct"
+
+[[routes]]
+rules = ["*"]
+
+[[routes.outs]]
+type = "direct"

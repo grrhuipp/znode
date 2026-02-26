@@ -1,0 +1,17 @@
+.{
+    .name = .znode,
+    .version = "0.1.0",
+    .fingerprint = 0xd17b382a0effa5f3,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
