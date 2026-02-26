@@ -328,6 +328,11 @@ pub const Session = struct {
     drain_active: bool = false,        // true = shutdown issued, waiting for I/O to drain
     drain_timer_running: bool = false, // true = drain timer trackOp is held
 
+    // ── Active session list (intrusive doubly-linked, owned by Worker) ──
+    // Used by the periodic session reaper to detect and force-close stuck sessions.
+    next_session: ?*Session = null,
+    prev_session: ?*Session = null,
+
     pub const State = conn_fsm.State;
 
     pub fn create(
@@ -579,7 +584,7 @@ pub const Session = struct {
     /// onCloseComplete → destroy) should handle all closes. But if pending_ops accounting
     /// goes wrong due to xev callback races or timer cancel edge cases, this prevents
     /// socket fd leaks that would consume kernel memory indefinitely.
-    fn forceDestroyLeaked(self: *Session) void {
+    pub fn forceDestroyLeaked(self: *Session) void {
         self.cfg.logger.err("#{d} [session] FORCE_DESTROY_LEAKED state={s} close_count={d}/{d}", .{
             self.metrics.conn_id,
             self.lifecycle.fsm.state.name(),
@@ -593,14 +598,15 @@ pub const Session = struct {
         // went wrong, some dup'd fds may still be open (keeping the socket alive
         // even after we close the original fd).
         if (comptime xev.backend == .epoll) {
-            const comps = [_]*xev.Completion{
+            // TCP I/O completions (may have dup'd fds)
+            const tcp_comps = [_]*xev.Completion{
                 &self.inbound.read_comp,
                 &self.inbound.write_comp,
                 &self.outbound.read_comp,
                 &self.outbound.write_comp,
                 &self.outbound.connect_comp,
             };
-            for (comps) |comp| {
+            for (tcp_comps) |comp| {
                 if (comp.flags.dup and comp.flags.dup_fd > 0) {
                     const linux = std.os.linux;
                     if (self.cached_loop) |l| {
@@ -609,7 +615,21 @@ pub const Session = struct {
                     std.posix.close(comp.flags.dup_fd);
                     comp.flags.dup_fd = 0;
                 }
-                // Mark dead to prevent xev from processing this completion
+                if (comp.flags.state == .active) {
+                    comp.flags.state = .dead;
+                    if (self.cached_loop) |l| l.active -|= 1;
+                } else if (comp.flags.state == .adding) {
+                    comp.flags.state = .dead;
+                }
+            }
+            // Timer completions (timeout, drain) — no dup fds but need dead marking
+            const timer_comps = [_]*xev.Completion{
+                &self.timeout.comp,
+                &self.timeout.cancel_comp,
+                &self.drain_comp,
+                &self.drain_cancel_comp,
+            };
+            for (timer_comps) |comp| {
                 if (comp.flags.state == .active) {
                     comp.flags.state = .dead;
                     if (self.cached_loop) |l| l.active -|= 1;
@@ -629,6 +649,11 @@ pub const Session = struct {
         // decremented during initiateClose (e.g., if initiateClose never ran).
         if (self.outbound.tcp != null and !self.lifecycle.fsm.isClosingOrClosed()) {
             _ = self.cfg.worker.conns_outbound.fetchSub(1, .monotonic);
+        }
+
+        // Decrement relay counter if session was in relay phase
+        if (self.lifecycle.fsm.isRelayingOrUdp()) {
+            _ = self.cfg.worker.conns_relay.fetchSub(1, .monotonic);
         }
 
         // Ensure FSM reaches terminal state for destroy()
@@ -652,6 +677,8 @@ pub const Session = struct {
             @tagName(self.lifecycle.close_reason),
             self.lifecycle.sockets_to_close,
         });
+        // Remove from active session list before freeing
+        self.cfg.worker.unlinkSession(self);
         self.timeout.deinitTimer();
         if (self.drain_timer) |*dt| dt.deinit();
         if (self.outbound.tls) |*ttls| ttls.deinit();
@@ -821,7 +848,7 @@ pub const Session = struct {
         return .disarm;
     }
 
-    fn currentMs() u64 {
+    pub fn currentMs() u64 {
         return @intCast(@max(0, std.time.milliTimestamp()));
     }
 
@@ -920,21 +947,16 @@ pub const Session = struct {
             .proxy_protocol => self.driveProxyProtocol(l, n),
             .tls_handshake => self.driveHandshake(l, n),
             .protocol_parse => self.driveProtocolParse(l, n),
-            // VMess outbound pre-response phase: allow uplink to avoid
-            // deadlock with servers that delay response header flush.
+            // VMess outbound pre-response phase: target_write_comp may be busy
+            // with the header write. Forwarding uplink here risks double-submit
+            // on outbound.write_comp, causing a leaked trackOp (callback overwritten,
+            // opDone never fires for the header write → session stuck forever).
+            // handleVMessPostWrite sends initial payload after header write completes.
             .outbound_vmess_header => blk: {
-                if (is_early_detect) {
-                    // Early disconnect detection read during VMess header write.
-                    // target_write_comp may be busy — can't safely forward uplink data.
-                    // Re-arm for the actual pre-response uplink read that
-                    // onOutboundHeaderWrite will (or already did) start.
-                    self.cfg.logger.debug("#{d} [inbound] EARLY_DETECT data={d}B state=vmess_header pending_ops={d}", .{
-                        self.metrics.conn_id, n, self.lifecycle.pending_ops,
-                    });
-                    self.startClientRead(l);
-                    break :blk .disarm;
-                }
-                break :blk self.driveRelayUplink(l, n);
+                self.cfg.logger.debug("#{d} [inbound] VMESS_HEADER_PHASE data={d}B early_detect={} pending_ops={d} (discarded)", .{
+                    self.metrics.conn_id, n, is_early_detect, self.lifecycle.pending_ops,
+                });
+                break :blk .disarm;
             },
             .relaying => self.driveRelayUplink(l, n),
             // half_close_target: target FIN'd but client still sending (uplink active)

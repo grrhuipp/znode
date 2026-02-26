@@ -62,6 +62,13 @@ pub const Worker = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     close_counter: u32 = 0,
 
+    // ── Active session list (intrusive doubly-linked, for reaper scan) ──
+    session_list_head: ?*proxy_conn.Session = null,
+    session_count: u32 = 0,
+    reaper_timer: ?xev.Timer = null,
+    reaper_comp: xev.Completion = .{},
+    reaped_sessions: u32 = 0, // total sessions force-closed by reaper
+
     // Session object pool (intrusive free list).
     // Avoids GPA alloc/free overhead per connection — reuses fixed-size structs.
     // Single-thread access only (worker thread), no synchronization needed.
@@ -91,6 +98,33 @@ pub const Worker = struct {
         } else {
             self.allocator.destroy(conn);
         }
+    }
+
+    /// Add a session to the active session list (call from worker thread only).
+    pub fn linkSession(self: *Worker, conn: *proxy_conn.Session) void {
+        conn.prev_session = null;
+        conn.next_session = self.session_list_head;
+        if (self.session_list_head) |head| {
+            head.prev_session = conn;
+        }
+        self.session_list_head = conn;
+        self.session_count += 1;
+    }
+
+    /// Remove a session from the active session list (call from worker thread only).
+    pub fn unlinkSession(self: *Worker, conn: *proxy_conn.Session) void {
+        if (conn.prev_session) |prev| {
+            prev.next_session = conn.next_session;
+        } else {
+            // conn was head
+            self.session_list_head = conn.next_session;
+        }
+        if (conn.next_session) |next| {
+            next.prev_session = conn.prev_session;
+        }
+        conn.prev_session = null;
+        conn.next_session = null;
+        self.session_count -|= 1;
     }
 
     pub const max_pending_fds = 1024;
@@ -289,6 +323,7 @@ pub const Worker = struct {
         for (self.listener_infos[0..self.listener_info_count]) |*info| {
             info.hot_cache.deinit(self.allocator);
         }
+        if (self.reaper_timer) |*rt| rt.deinit();
         // Drain connection object pool
         while (self.conn_pool_head) |head| {
             self.conn_pool_head = head.next;
@@ -355,6 +390,12 @@ pub const Worker = struct {
 
         // Register async notification handler
         self.async_notify.wait(&self.loop, &self.async_completion, Worker, self, &onAsyncNotify);
+
+        // Start session reaper timer (scans for stuck sessions every 30s)
+        self.reaper_timer = xev.Timer.init() catch null;
+        if (self.reaper_timer) |*rt| {
+            rt.run(&self.loop, &self.reaper_comp, 30_000, Worker, self, &onReaperTimer);
+        }
 
         // Run the event loop
         self.loop.run(.until_done) catch |e| {
@@ -436,7 +477,101 @@ pub const Worker = struct {
         conn.metrics.src_addr = src_addr;
         if (src_addr) |sa| conn.cfg.logger.setClientIp(sa);
         conn.cfg.local_addr = local_addr;
+        self.linkSession(conn);
         conn.start(loop);
+    }
+
+    // ── Session reaper: periodic scan for stuck sessions ──
+
+    fn onReaperTimer(ud: ?*Worker, l: *xev.Loop, _: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = ud.?;
+        _ = r catch return .disarm;
+        if (!self.running.load(.acquire)) return .disarm;
+
+        self.reapStuckSessions(l);
+
+        // Reschedule every 30s
+        if (self.reaper_timer) |*rt| {
+            rt.run(l, &self.reaper_comp, 30_000, Worker, self, &onReaperTimer);
+        }
+        return .disarm;
+    }
+
+    fn reapStuckSessions(self: *Worker, loop: *xev.Loop) void {
+        const now = proxy_conn.Session.currentMs();
+        var reaped: u32 = 0;
+        var scanned: u32 = 0;
+
+        // Walk the active session list and find stuck sessions
+        var cur = self.session_list_head;
+        while (cur) |conn| {
+            // Save next BEFORE potential destroy (which unlinks conn)
+            const next = conn.next_session;
+            scanned += 1;
+
+            const age_ms = now -| conn.metrics.conn_start_ms;
+
+            // Skip sessions that are already in proper closing flow
+            if (conn.lifecycle.fsm.isClosed()) {
+                cur = next;
+                continue;
+            }
+
+            // Rule 1: Pre-relay sessions alive > 120s — handshake stuck
+            const is_relay = conn.lifecycle.fsm.isRelayingOrUdp() or
+                conn.lifecycle.fsm.is(.half_close_client) or
+                conn.lifecycle.fsm.is(.half_close_target);
+            if (!is_relay and !conn.lifecycle.fsm.isClosingOrClosed() and age_ms > 120_000) {
+                self.logger.warn("REAPER: #{d} stuck pre-relay state={s} age={d}s pending_ops={d}", .{
+                    conn.metrics.conn_id,
+                    conn.lifecycle.fsm.state.name(),
+                    age_ms / 1000,
+                    conn.lifecycle.pending_ops,
+                });
+                conn.forceDestroyLeaked();
+                reaped += 1;
+                cur = next;
+                continue;
+            }
+
+            // Rule 2: Closing sessions alive > 60s — drain stuck
+            if (conn.lifecycle.fsm.isClosingOrClosed() and age_ms > 60_000) {
+                self.logger.warn("REAPER: #{d} stuck closing state={s} age={d}s pending_ops={d}", .{
+                    conn.metrics.conn_id,
+                    conn.lifecycle.fsm.state.name(),
+                    age_ms / 1000,
+                    conn.lifecycle.pending_ops,
+                });
+                conn.forceDestroyLeaked();
+                reaped += 1;
+                cur = next;
+                continue;
+            }
+
+            // Rule 3: Any session alive > 3600s with 0 bytes — zombie
+            if (age_ms > 3_600_000 and conn.metrics.conn_bytes_up == 0 and conn.metrics.conn_bytes_dn == 0) {
+                self.logger.warn("REAPER: #{d} zombie state={s} age={d}s pending_ops={d}", .{
+                    conn.metrics.conn_id,
+                    conn.lifecycle.fsm.state.name(),
+                    age_ms / 1000,
+                    conn.lifecycle.pending_ops,
+                });
+                conn.forceDestroyLeaked();
+                reaped += 1;
+                cur = next;
+                continue;
+            }
+
+            _ = loop; // used by initiateClose if we add soft-close path later
+            cur = next;
+        }
+
+        if (reaped > 0) {
+            self.reaped_sessions += reaped;
+            self.logger.warn("REAPER: reaped {d} stuck sessions (scanned={d}, total_reaped={d})", .{
+                reaped, scanned, self.reaped_sessions,
+            });
+        }
     }
 
     pub fn connectionClosed(self: *Worker) void {
