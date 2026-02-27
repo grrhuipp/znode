@@ -19,7 +19,7 @@ jobs:
 
       - name: Patch Zig std library
         run: |
-          ZIG_LIB=$(zig env | python3 -c "import sys,json; print(json.load(sys.stdin)['lib_dir'])")
+          ZIG_LIB="$(dirname $(which zig))/lib"
           cp patches/std/compress/flate/Decompress.zig "$ZIG_LIB/std/compress/flate/Decompress.zig"
 
       - name: Cache Zig build artifacts
