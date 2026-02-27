@@ -13,6 +13,32 @@ pub const OptionFlags = vmess_protocol.OptionFlags;
 const gcm_tag_len = Aes128Gcm.tag_length; // 16
 const chacha_tag_len = ChaCha20Poly1305.tag_length; // 16
 
+pub const DecryptErrorKind = enum(u8) {
+    auth_length_size_aead_fail,
+    chunk_too_large,
+    payload_smaller_than_padding,
+    encrypted_too_short_for_tag,
+    output_buffer_too_small,
+    data_aead_fail,
+};
+
+pub const DecryptDebugInfo = struct {
+    kind: DecryptErrorKind,
+    data_len: usize,
+    size_field_len: usize,
+    total_payload: usize,
+    padding_len: usize,
+    enc_len: usize,
+    tag_len: usize,
+    wire_len: usize,
+    nonce_counter: u16,
+    auth_length_nonce_counter: u16,
+    security: SecurityMethod,
+    auth_length: bool,
+    chunk_masking: bool,
+    global_padding: bool,
+};
+
 /// Per-direction stream cipher state for VMess chunk stream.
 pub const StreamState = struct {
     /// AES-128-GCM key (16B) or ChaCha20-Poly1305 expanded key (32B)
@@ -35,6 +61,8 @@ pub const StreamState = struct {
     /// Key = KDF16(body_key, "auth_len"), separate nonce counter
     auth_length_key: [16]u8 = undefined,
     auth_length_nonce_counter: u16 = 0,
+    /// Last decrypt integrity_error details (for diagnostics in upper layers).
+    last_decrypt_error: ?DecryptDebugInfo = null,
 
     const PendingDecode = struct {
         total_payload: u16,
@@ -109,6 +137,44 @@ pub const StreamState = struct {
     /// Get next 2-byte ShakeMask for length masking.
     fn nextLengthMask(self: *StreamState) u16 {
         return self.shake_mask.nextMask();
+    }
+
+    fn clearDecryptError(self: *StreamState) void {
+        self.last_decrypt_error = null;
+    }
+
+    fn failDecrypt(
+        self: *StreamState,
+        kind: DecryptErrorKind,
+        data_len: usize,
+        size_field_len: usize,
+        total_payload: usize,
+        padding_len: usize,
+        enc_len: usize,
+        tag_len: usize,
+        wire_len: usize,
+    ) DecryptResult {
+        self.last_decrypt_error = .{
+            .kind = kind,
+            .data_len = data_len,
+            .size_field_len = size_field_len,
+            .total_payload = total_payload,
+            .padding_len = padding_len,
+            .enc_len = enc_len,
+            .tag_len = tag_len,
+            .wire_len = wire_len,
+            .nonce_counter = self.nonce_counter,
+            .auth_length_nonce_counter = self.auth_length_nonce_counter,
+            .security = self.security,
+            .auth_length = self.options.auth_length,
+            .chunk_masking = self.options.chunk_masking,
+            .global_padding = self.options.global_padding,
+        };
+        return .integrity_error;
+    }
+
+    pub fn lastDecryptError(self: *const StreamState) ?DecryptDebugInfo {
+        return self.last_decrypt_error;
     }
 };
 
@@ -247,6 +313,8 @@ pub fn encryptChunk(state: *StreamState, plaintext: []const u8, out_buf: []u8) ?
 /// Legacy: mask call order (matching acppnode): padding mask first, then length mask.
 /// auth_length: AEAD-decrypt 18B → 2B size; no padding, no ShakeMask.
 pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) DecryptResult {
+    state.clearDecryptError();
+
     var padding_len: usize = undefined;
     var total_payload: usize = undefined;
     const size_field_len: usize = if (state.options.auth_length) 2 + gcm_tag_len else 2; // 18 or 2
@@ -269,7 +337,16 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
             &[_]u8{},
             size_nonce,
             state.auth_length_key,
-        ) catch return .integrity_error;
+        ) catch return state.failDecrypt(
+            .auth_length_size_aead_fail,
+            data.len,
+            size_field_len,
+            0,
+            0,
+            0,
+            gcm_tag_len,
+            0,
+        );
 
         state.auth_length_nonce_counter +%= 1;
         total_payload = std.mem.readInt(u16, &size_plaintext, .big);
@@ -296,7 +373,16 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
     // Chunk size limit (16KB + 64 padding max)
     if (total_payload > vmess_crypto.max_chunk_size + 64) {
         state.pending_decode = null;
-        return .integrity_error;
+        return state.failDecrypt(
+            .chunk_too_large,
+            data.len,
+            size_field_len,
+            total_payload,
+            padding_len,
+            0,
+            tag_len,
+            0,
+        );
     }
 
     // Check we have enough data — save decoded state for next call
@@ -313,13 +399,46 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
     state.pending_decode = null;
 
     // Subtract padding to get encrypted data length
-    if (total_payload < padding_len) return .integrity_error;
+    if (total_payload < padding_len) {
+        return state.failDecrypt(
+            .payload_smaller_than_padding,
+            data.len,
+            size_field_len,
+            total_payload,
+            padding_len,
+            0,
+            tag_len,
+            wire_len,
+        );
+    }
     const enc_len = total_payload - padding_len;
 
-    if (enc_len < tag_len) return .integrity_error;
+    if (enc_len < tag_len) {
+        return state.failDecrypt(
+            .encrypted_too_short_for_tag,
+            data.len,
+            size_field_len,
+            total_payload,
+            padding_len,
+            enc_len,
+            tag_len,
+            wire_len,
+        );
+    }
     const plaintext_len = enc_len - tag_len;
 
-    if (out_buf.len < plaintext_len) return .integrity_error;
+    if (out_buf.len < plaintext_len) {
+        return state.failDecrypt(
+            .output_buffer_too_small,
+            data.len,
+            size_field_len,
+            total_payload,
+            padding_len,
+            enc_len,
+            tag_len,
+            wire_len,
+        );
+    }
 
     // Decrypt (only the enc_len portion, skip trailing padding)
     const ct_end = size_field_len + plaintext_len;
@@ -334,7 +453,16 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
                 &[_]u8{},
                 nonce,
                 state.key[0..16].*,
-            ) catch return .integrity_error;
+            ) catch return state.failDecrypt(
+                .data_aead_fail,
+                data.len,
+                size_field_len,
+                total_payload,
+                padding_len,
+                enc_len,
+                tag_len,
+                wire_len,
+            );
         },
         .aes_256_gcm => {
             const nonce = state.buildNonce();
@@ -345,7 +473,16 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
                 &[_]u8{},
                 nonce,
                 state.key,
-            ) catch return .integrity_error;
+            ) catch return state.failDecrypt(
+                .data_aead_fail,
+                data.len,
+                size_field_len,
+                total_payload,
+                padding_len,
+                enc_len,
+                tag_len,
+                wire_len,
+            );
         },
         .chacha20_poly1305 => {
             const nonce = state.buildNonce();
@@ -356,7 +493,16 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
                 &[_]u8{},
                 nonce,
                 state.key,
-            ) catch return .integrity_error;
+            ) catch return state.failDecrypt(
+                .data_aead_fail,
+                data.len,
+                size_field_len,
+                total_payload,
+                padding_len,
+                enc_len,
+                tag_len,
+                wire_len,
+            );
         },
         .none => {
             @memcpy(out_buf[0..plaintext_len], data[size_field_len..ct_end]);

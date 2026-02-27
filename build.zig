@@ -6,11 +6,11 @@ pub fn build(b: *std.Build) void {
 
     // ── Dependencies ──
     // zio async I/O (coroutine-based)
-    // Force io_uring on Linux
+    // Force epoll on Linux
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
-        .backend = if (target.result.os.tag == .linux) @as(?[]const u8, "io_uring") else null,
+        .backend = if (target.result.os.tag == .linux) @as(?[]const u8, "epoll") else null,
     });
     const zio_mod = zio_dep.module("zio");
 

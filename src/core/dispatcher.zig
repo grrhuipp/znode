@@ -4,6 +4,7 @@ const log = @import("log.zig");
 const Worker = @import("worker.zig").Worker;
 const config_mod = @import("config.zig");
 const session_handler = @import("session_handler.zig");
+const ip_error_ban_mod = @import("ip_error_ban.zig");
 
 /// ConnectionDispatcher: accepts connections and spawns session handler coroutines.
 /// Uses zio coroutines for accept loops + session handling (replaces xev + Worker threads).
@@ -190,6 +191,13 @@ pub const Dispatcher = struct {
             };
 
             self.total_accepted += 1;
+
+            const client_ip_hash = ip_error_ban_mod.hashIpAddress(stream.socket.address.ip);
+            if (shared.ip_error_ban.isBanned(client_ip_hash, std.time.milliTimestamp())) {
+                self.logger.debug("blocked banned client hash={x} on lid={d}", .{ client_ip_hash, listener_id });
+                stream.close();
+                continue;
+            }
 
             // Spawn session handler coroutine (zio runtime schedules across executors)
             const info = &self.listener_infos[listener_id];

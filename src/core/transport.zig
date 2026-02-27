@@ -43,6 +43,56 @@ pub const Transport = struct {
     }
 };
 
+// ── PrefixedTransport ──
+
+/// Transport wrapper that replays a captured prefix before reading from lower.
+/// Used for protocol sniff/detection paths where we must pre-read bytes safely.
+pub const PrefixedTransport = struct {
+    lower: Transport,
+    prefix_buf: [8192]u8 = undefined,
+    prefix_len: usize = 0,
+    prefix_pos: usize = 0,
+
+    const prefixed_vtable = VTable{
+        .readFn = prefixedRead,
+        .writeFn = prefixedWrite,
+    };
+
+    pub fn init(lower: Transport, prefix: []const u8) PrefixedTransport {
+        var p = PrefixedTransport{ .lower = lower };
+        p.prefix_len = @min(prefix.len, p.prefix_buf.len);
+        if (p.prefix_len > 0) {
+            @memcpy(p.prefix_buf[0..p.prefix_len], prefix[0..p.prefix_len]);
+        }
+        return p;
+    }
+
+    pub fn transport(self: *PrefixedTransport) Transport {
+        return .{ .ptr = @ptrCast(self), .vtable = &prefixed_vtable };
+    }
+
+    const VTable = Transport.VTable;
+
+    fn prefixedRead(ptr: *anyopaque, buf: []u8, timeout: zio.Timeout) anyerror!usize {
+        const self: *PrefixedTransport = @ptrCast(@alignCast(ptr));
+        if (self.prefix_pos < self.prefix_len) {
+            const avail = self.prefix_len - self.prefix_pos;
+            const n = @min(buf.len, avail);
+            if (n > 0) {
+                @memcpy(buf[0..n], self.prefix_buf[self.prefix_pos .. self.prefix_pos + n]);
+                self.prefix_pos += n;
+                return n;
+            }
+        }
+        return self.lower.read(buf, timeout);
+    }
+
+    fn prefixedWrite(ptr: *anyopaque, data: []const u8, timeout: zio.Timeout) anyerror!void {
+        const self: *PrefixedTransport = @ptrCast(@alignCast(ptr));
+        return self.lower.write(data, timeout);
+    }
+};
+
 // ── RawTransport ──
 
 /// Direct TCP transport — no encryption, no framing.
@@ -179,6 +229,10 @@ pub const WsTransport = struct {
     ws: *ws_mod.WsStream,
     read_buf: []u8, // for WS framed data from lower transport
     write_buf: []u8, // for WS frame encoding output
+    // Pending decrypted payload from the current WS frame.
+    // Needed because upper layers may read in small chunks (e.g. VMess header 42B).
+    pending_len: usize = 0,
+    pending_pos: usize = 0,
 
     const ws_vtable = VTable{
         .readFn = wsRead,
@@ -200,7 +254,9 @@ pub const WsTransport = struct {
             switch (self.ws.handshake()) {
                 .bytes => return, // handshake complete
                 .want_read => {
-                    const n = try self.lower.read(self.read_buf, timeout);
+                    const cap = @min(self.read_buf.len, self.ws.inputSpace());
+                    if (cap == 0) return error.WsHandshakeBufferFull;
+                    const n = try self.lower.read(self.read_buf[0..cap], timeout);
                     if (n == 0) return error.WsConnectionClosed;
                     _ = try self.ws.feedNetworkData(self.read_buf[0..n]);
                 },
@@ -214,10 +270,33 @@ pub const WsTransport = struct {
     fn wsRead(ptr: *anyopaque, buf: []u8, timeout: zio.Timeout) anyerror!usize {
         const self: *WsTransport = @ptrCast(@alignCast(ptr));
 
+        if (buf.len == 0) return 0;
+
+        // Serve buffered decrypted bytes first.
+        if (self.pending_pos < self.pending_len) {
+            const available = self.pending_len - self.pending_pos;
+            const n_copy = @min(buf.len, available);
+            @memcpy(buf[0..n_copy], self.read_buf[self.pending_pos .. self.pending_pos + n_copy]);
+            self.pending_pos += n_copy;
+            if (self.pending_pos == self.pending_len) {
+                self.pending_pos = 0;
+                self.pending_len = 0;
+            }
+            return n_copy;
+        }
+
         while (true) {
             // Try to decode a frame from buffered WS data
-            switch (self.ws.readDecrypted(buf)) {
-                .bytes => |n| return n,
+            switch (self.ws.readDecrypted(self.read_buf)) {
+                .bytes => |n| {
+                    const n_copy = @min(buf.len, n);
+                    @memcpy(buf[0..n_copy], self.read_buf[0..n_copy]);
+                    if (n_copy < n) {
+                        self.pending_pos = n_copy;
+                        self.pending_len = n;
+                    }
+                    return n_copy;
+                },
                 .closed => return 0,
                 .err => return error.WsReadError,
                 .want_read, .want_write => {},
@@ -227,10 +306,57 @@ pub const WsTransport = struct {
             try self.flushWsOutput(timeout);
 
             // Need more data from lower transport
-            const n = try self.lower.read(self.read_buf, timeout);
+            const cap = @min(self.read_buf.len, self.ws.inputSpace());
+            if (cap == 0) {
+                const dbg = self.ws.debugState();
+                const pending_unread = self.pending_len - self.pending_pos;
+                log.warn("ws frame buffer full before read: hs_len={d} leftover={d} avail={d} space={d} pending={d} out_pending={d} hs_done={} hdr={} opcode={d} fin={} masked={} payload={d} hdr_size={d} frame_total={d} frame_complete={} parse_blocked={}", .{
+                    dbg.hs_len,
+                    dbg.leftover_start,
+                    dbg.available,
+                    dbg.input_space,
+                    pending_unread,
+                    dbg.out_pending,
+                    dbg.handshake_done,
+                    dbg.has_frame_header,
+                    dbg.frame_opcode,
+                    dbg.frame_fin,
+                    dbg.frame_masked,
+                    dbg.frame_payload_len,
+                    dbg.frame_header_size,
+                    dbg.frame_total_size,
+                    dbg.frame_complete,
+                    dbg.parse_blocked,
+                });
+                return error.WsFrameBufferFull;
+            }
+            const n = try self.lower.read(self.read_buf[0..cap], timeout);
             if (n == 0) return 0; // EOF
 
-            _ = self.ws.feedNetworkData(self.read_buf[0..n]) catch return error.WsFrameBufferFull;
+            _ = self.ws.feedNetworkData(self.read_buf[0..n]) catch {
+                const dbg = self.ws.debugState();
+                const pending_unread = self.pending_len - self.pending_pos;
+                log.warn("ws frame buffer full on feed: read={d} hs_len={d} leftover={d} avail={d} space={d} pending={d} out_pending={d} hs_done={} hdr={} opcode={d} fin={} masked={} payload={d} hdr_size={d} frame_total={d} frame_complete={} parse_blocked={}", .{
+                    n,
+                    dbg.hs_len,
+                    dbg.leftover_start,
+                    dbg.available,
+                    dbg.input_space,
+                    pending_unread,
+                    dbg.out_pending,
+                    dbg.handshake_done,
+                    dbg.has_frame_header,
+                    dbg.frame_opcode,
+                    dbg.frame_fin,
+                    dbg.frame_masked,
+                    dbg.frame_payload_len,
+                    dbg.frame_header_size,
+                    dbg.frame_total_size,
+                    dbg.frame_complete,
+                    dbg.parse_blocked,
+                });
+                return error.WsFrameBufferFull;
+            };
         }
     }
 
@@ -256,6 +382,7 @@ pub const WsTransport = struct {
 /// Holds concrete transport instances — lifetime must outlive the Transport vtable.
 /// Allocated on stack in session_handler, one per transport direction (inbound/outbound).
 pub const TransportStorage = struct {
+    prefixed_transport: PrefixedTransport = undefined,
     raw: RawTransport = undefined,
     tls_transport: TlsTransport = undefined,
     ws_transport: WsTransport = undefined,

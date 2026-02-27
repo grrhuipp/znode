@@ -365,6 +365,7 @@ const SsOutboundDecoder = struct {
     const decoder_vtable = Codec.VTable{
         .encryptFn = noopEncrypt,
         .decryptFn = lazyDecrypt,
+        .decryptDebugFn = noDecryptDebug,
     };
 
     fn codec(self: *SsOutboundDecoder) Codec {
@@ -404,6 +405,10 @@ const SsOutboundDecoder = struct {
 
         // After initialization: normal frame decrypt
         return convertDecryptResult(self.decrypt_state.decryptFrame(data, out), 0);
+    }
+
+    fn noDecryptDebug(_: *anyopaque) ?codec_mod.DecryptDebugInfo {
+        return null;
     }
 };
 

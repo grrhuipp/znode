@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const log_mod = @import("log.zig");
 const codec_mod = @import("codec.zig");
 const conn_types = @import("conn_types.zig");
 const inbound_result_mod = @import("inbound_result.zig");
@@ -20,6 +21,7 @@ const transport_mod = @import("transport.zig");
 const Transport = transport_mod.Transport;
 const user_store_mod = @import("user_store.zig");
 const trojan_inbound = @import("../protocol/trojan/trojan_inbound.zig");
+const trojan_protocol = @import("../protocol/trojan/trojan_protocol.zig");
 const vmess_inbound = @import("../protocol/vmess/vmess_inbound.zig");
 const vmess_protocol = @import("../protocol/vmess/vmess_protocol.zig");
 const vmess_hot_cache = @import("../protocol/vmess/vmess_hot_cache.zig");
@@ -35,6 +37,7 @@ const CodecPair = codec_mod.CodecPair;
 const VMessCodec = codec_mod.VMessCodec;
 const SsCodec = codec_mod.SsCodec;
 const InboundProtocol = conn_types.InboundProtocol;
+const Logger = log_mod.ScopedLogger;
 
 /// Inbound protocol handler — unified streaming interface.
 pub const InboundHandler = struct {
@@ -54,6 +57,7 @@ pub const InboundHandler = struct {
             plain_buf: []u8,
             payload_buf: []u8,
             timeout: zio.Timeout,
+            lg: *Logger,
         ) anyerror!ParsedAction,
 
         /// Extract CodecPair from parsed protocol state (decrypt uplink + encrypt downlink).
@@ -70,8 +74,9 @@ pub const InboundHandler = struct {
         plain_buf: []u8,
         payload_buf: []u8,
         timeout: zio.Timeout,
+        lg: *Logger,
     ) anyerror!ParsedAction {
-        return self.vtable.parseStreamingFn(self.ptr, t, work_buf, plain_buf, payload_buf, timeout);
+        return self.vtable.parseStreamingFn(self.ptr, t, work_buf, plain_buf, payload_buf, timeout, lg);
     }
 
     pub inline fn codecs(self: InboundHandler, state: *InboundProtocol) CodecPair {
@@ -82,6 +87,135 @@ pub const InboundHandler = struct {
         return self.vtable.responseFn(self.ptr, action);
     }
 };
+
+fn bytesToHex(dst: []u8, src: []const u8) []const u8 {
+    const hex = "0123456789abcdef";
+    var i: usize = 0;
+    for (src) |b| {
+        if (i + 2 > dst.len) break;
+        dst[i] = hex[b >> 4];
+        dst[i + 1] = hex[b & 0x0f];
+        i += 2;
+    }
+    return dst[0..i];
+}
+
+fn isHexAscii(s: []const u8) bool {
+    for (s) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or
+            (ch >= 'a' and ch <= 'f') or
+            (ch >= 'A' and ch <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn countEnabledUsers(users: *const user_store_mod.UserStore.UserMap) usize {
+    var enabled: usize = 0;
+    for (users.users) |u| {
+        if (u.enabled) enabled += 1;
+    }
+    return enabled;
+}
+
+fn debugVmessAuthFailure(
+    lg: *Logger,
+    users: *const user_store_mod.UserStore.UserMap,
+    preamble: []const u8,
+    hot_cache_enabled: bool,
+) void {
+    if (!lg.enabled(.debug)) return;
+    if (preamble.len < 42) return;
+
+    var auth_id_hex_buf: [32]u8 = undefined;
+    var enc_len_hex_buf: [36]u8 = undefined;
+    var nonce_hex_buf: [16]u8 = undefined;
+    const auth_id_hex = bytesToHex(&auth_id_hex_buf, preamble[0..16]);
+    const enc_len_hex = bytesToHex(&enc_len_hex_buf, preamble[16..34]);
+    const nonce_hex = bytesToHex(&nonce_hex_buf, preamble[34..42]);
+
+    lg.debug("vmess auth detail: auth_id={s} enc_len={s} nonce={s} users={d}/{d} hot_cache={}", .{
+        auth_id_hex,
+        enc_len_hex,
+        nonce_hex,
+        countEnabledUsers(users),
+        users.users.len,
+        hot_cache_enabled,
+    });
+}
+
+fn debugTrojanAuthFailure(
+    lg: *Logger,
+    store: ?*user_store_mod.UserStore,
+    data: []const u8,
+) void {
+    if (!lg.enabled(.debug)) return;
+
+    const users_opt = if (store) |s| s.getUsers() else null;
+    const users_total: usize = if (users_opt) |u| u.users.len else 0;
+
+    switch (trojan_protocol.parseRequest(data)) {
+        .incomplete => {
+            lg.debug("trojan auth detail: state=incomplete bytes={d} users={d}", .{
+                data.len,
+                users_total,
+            });
+        },
+        .protocol_error => {
+            const preview = data[0..@min(data.len, 64)];
+            const hash_like = data.len >= trojan_protocol.HASH_LEN and isHexAscii(data[0..trojan_protocol.HASH_LEN]);
+            if (hash_like) {
+                lg.debug("trojan auth detail: state=protocol_error hash={s} bytes={d} users={d} preview={s}", .{
+                    data[0..trojan_protocol.HASH_LEN],
+                    data.len,
+                    users_total,
+                    preview,
+                });
+            } else {
+                lg.debug("trojan auth detail: state=protocol_error bytes={d} users={d} preview={s}", .{
+                    data.len,
+                    users_total,
+                    preview,
+                });
+            }
+        },
+        .success => |req| {
+            var matched_uid: i64 = -1;
+            if (users_opt) |users| {
+                if (users.findByPasswordHash(&req.password_hash)) |u| {
+                    matched_uid = u.id;
+                }
+            }
+            const domain = if (req.target.addr_type == .domain) req.target.getDomain() else "-";
+            lg.debug("trojan auth detail: hash={s} matched_uid={d} cmd={s} target_type={s} port={d} domain={s} users={d}", .{
+                req.password_hash[0..],
+                matched_uid,
+                @tagName(req.command),
+                @tagName(req.target.addr_type),
+                req.target.port,
+                domain,
+                users_total,
+            });
+        },
+    }
+}
+
+fn isTrojanAuthFailure(
+    store: ?*user_store_mod.UserStore,
+    data: []const u8,
+) bool {
+    return switch (trojan_protocol.parseRequest(data)) {
+        .success => |req| blk: {
+            const users_opt = if (store) |s| s.getUsers() else null;
+            if (users_opt) |users| {
+                break :blk users.findByPasswordHash(&req.password_hash) == null;
+            }
+            // No users configured: treat as auth-side failure.
+            break :blk true;
+        },
+        .incomplete, .protocol_error => false,
+    };
+}
 
 // ── Trojan Inbound ──
 
@@ -108,6 +242,7 @@ pub const TrojanInbound = struct {
         _: []u8,
         payload_buf: []u8,
         timeout: zio.Timeout,
+        lg: *Logger,
     ) anyerror!ParsedAction {
         const self: *TrojanInbound = @ptrCast(@alignCast(ptr));
         var accumulated: usize = 0;
@@ -122,7 +257,13 @@ pub const TrojanInbound = struct {
                 .udp_associate => |act| return .{ .action = act, .is_udp = true },
                 .need_more => continue,
                 .close => |_| return error.ProtocolRejected,
-                .fallback => return error.Fallback,
+                .fallback => {
+                    debugTrojanAuthFailure(lg, self.user_store, work_buf[0..accumulated]);
+                    if (isTrojanAuthFailure(self.user_store, work_buf[0..accumulated])) {
+                        return error.TrojanAuthFailed;
+                    }
+                    return error.Fallback;
+                },
             }
         }
         return error.ProtocolBufferFull;
@@ -173,6 +314,7 @@ pub const VMessInbound = struct {
         _: []u8,
         _: []u8,
         timeout: zio.Timeout,
+        lg: *Logger,
     ) anyerror!ParsedAction {
         const self: *VMessInbound = @ptrCast(@alignCast(ptr));
         const user_map_opt = if (self.user_store) |us| us.getUsers() else null;
@@ -193,7 +335,10 @@ pub const VMessInbound = struct {
                 self.hot_cache,
                 self.allocator,
                 now,
-            ) orelse return error.VMessAuthFailed;
+            ) orelse {
+                debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
+                return error.VMessAuthFailed;
+            };
         };
 
         // 3. Read remaining header: EncHeader(header_len) + GCM-tag(16)
@@ -214,7 +359,10 @@ pub const VMessInbound = struct {
             switch (result) {
                 .success => |r| break :blk r,
                 .incomplete => return error.VMessIncomplete,
-                .auth_failed => return error.VMessAuthFailed,
+                .auth_failed => {
+                    debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
+                    return error.VMessAuthFailed;
+                },
                 .replay_detected => return error.VMessReplay,
                 .protocol_error => return error.VMessProtocolError,
             }
@@ -315,6 +463,7 @@ pub const SsInbound = struct {
         plain_buf: []u8,
         payload_buf: []u8,
         timeout: zio.Timeout,
+        _: *Logger,
     ) anyerror!ParsedAction {
         const self: *SsInbound = @ptrCast(@alignCast(ptr));
         const salt_size = self.method.saltSize();

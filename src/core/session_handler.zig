@@ -28,6 +28,8 @@ const TargetAddress = session_mod.TargetAddress;
 const tls_mod = @import("../transport/tls_stream.zig");
 const ws_mod = @import("../transport/ws_stream.zig");
 const transport_mod = @import("transport.zig");
+const proxy_protocol = @import("../protocol/proxy_protocol.zig");
+const ip_error_ban_mod = @import("ip_error_ban.zig");
 const Transport = transport_mod.Transport;
 const TransportStorage = transport_mod.TransportStorage;
 
@@ -61,6 +63,7 @@ pub const BufPool = buf_pool_mod.FixedPool(SessionBufs, 64);
 pub const Shared = struct {
     allocator: std.mem.Allocator,
     router: *router_mod.Router,
+    ip_error_ban: ip_error_ban_mod.IpErrorBan = .{},
     replay_filter: vmess_protocol.ReplayFilter = .{},
     replay_mutex: std.Thread.Mutex = .{},
     active_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -73,6 +76,8 @@ const buf_size: usize = 20 * 1024;
 /// Max plaintext per encrypt call. Must not exceed SS AEAD max_payload_size (0x3FFF = 16383);
 /// also leaves room for VMess AEAD overhead (tag + padding) within buf_size.
 const max_encrypt_payload: usize = 16383;
+/// Max bytes to dump as hex when decrypt/incomplete anomalies occur.
+const error_sample_bytes: usize = 24;
 
 /// Heap-allocated per-session buffers.
 const SessionBufs = struct {
@@ -126,6 +131,16 @@ const SessionLog = struct {
     }
 };
 
+fn shouldCountIpBanError(err: anyerror) bool {
+    return switch (err) {
+        // Ban only on authentication failures.
+        error.VMessAuthFailed,
+        error.TrojanAuthFailed,
+        => true,
+        else => false,
+    };
+}
+
 // ══════════════════════════════════════════════════════════════
 //  Entry Point
 // ══════════════════════════════════════════════════════════════
@@ -137,6 +152,7 @@ pub fn handleSession(
     shared: *Shared,
 ) void {
     defer stream.close();
+    const client_ip_hash = ip_error_ban_mod.hashIpAddress(stream.socket.address.ip);
     const session_id = shared.total_sessions.fetchAdd(1, .monotonic);
     _ = shared.active_sessions.fetchAdd(1, .monotonic);
 
@@ -160,6 +176,17 @@ pub fn handleSession(
         if (err == error.Canceled) {
             logger.debug("canceled at {s}", .{slog.stage});
             return;
+        }
+        if (shouldCountIpBanError(err)) {
+            const now_ms = std.time.milliTimestamp();
+            const ev = shared.ip_error_ban.recordError(client_ip_hash, now_ms);
+            if (ev.banned_now) {
+                logger.warn("ip_error_ban triggered: {d} errors/{d}s -> ban {d}s", .{
+                    shared.ip_error_ban.threshold(),
+                    shared.ip_error_ban.windowSeconds(),
+                    shared.ip_error_ban.banSeconds(),
+                });
+            }
         }
         const target = slog.getTarget();
         switch (err) {
@@ -200,12 +227,14 @@ fn handleSessionInner(
     slog.stage = "inbound_transport";
     var in_tls: ?tls_mod.TlsStream = null;
     defer if (in_tls) |*t| t.deinit();
+    var in_ws_storage: ws_mod.WsStream = undefined;
     var in_storage: TransportStorage = .{};
 
     const in_t = try buildInboundTransport(
         stream,
         info,
         &in_tls,
+        &in_ws_storage,
         &in_storage,
         &bufs.in_read,
         &bufs.in_write,
@@ -353,6 +382,7 @@ fn buildInboundTransport(
     stream: zio.net.Stream,
     info: *const Worker.ListenerInfo,
     in_tls: *?tls_mod.TlsStream,
+    in_ws_storage: *ws_mod.WsStream,
     storage: *TransportStorage,
     read_buf: []u8,
     write_buf: []u8,
@@ -360,6 +390,7 @@ fn buildInboundTransport(
 ) !Transport {
     storage.raw = .{ .stream = stream };
     var current = storage.raw.transport();
+    current = try applyProxyProtocolAutoDetect(current, storage, lg);
 
     if (info.tls_enabled) {
         lg.debug("inbound TLS handshake starting", .{});
@@ -376,7 +407,102 @@ fn buildInboundTransport(
         lg.debug("inbound TLS handshake done", .{});
     }
 
+    if (info.transport == .ws or info.transport == .wss) {
+        lg.debug("inbound WS handshake starting", .{});
+        in_ws_storage.* = ws_mod.WsStream.initServer(info.getWsPath(), "");
+        storage.ws_transport = .{
+            .lower = current,
+            .ws = in_ws_storage,
+            .read_buf = read_buf,
+            .write_buf = write_buf,
+        };
+        try storage.ws_transport.doHandshake(hs_timeout);
+        current = storage.ws_transport.transport();
+        lg.debug("inbound WS handshake done", .{});
+    }
+
     return current;
+}
+
+fn applyProxyProtocolAutoDetect(
+    current: Transport,
+    storage: *TransportStorage,
+    lg: *Logger,
+) !Transport {
+    var probe_buf: [8192]u8 = undefined;
+    const first_cap = @min(@as(usize, 512), probe_buf.len);
+
+    var total = try current.read(probe_buf[0..first_cap], hs_timeout);
+    if (total == 0) return error.ConnectionClosed;
+
+    while (proxyProtocolNeedMore(probe_buf[0..total]) and total < probe_buf.len) {
+        const n = try current.read(probe_buf[total..], hs_timeout);
+        if (n == 0) break;
+        total += n;
+
+        const early = proxy_protocol.parse(probe_buf[0..total]);
+        if (early.success) break;
+    }
+
+    const parsed = proxy_protocol.parse(probe_buf[0..total]);
+    const replay = if (parsed.success) probe_buf[parsed.consumed..total] else probe_buf[0..total];
+    storage.prefixed_transport = transport_mod.PrefixedTransport.init(current, replay);
+
+    if (parsed.success) {
+        var src_buf: [96]u8 = undefined;
+        if (formatProxySource(parsed, &src_buf)) |src| {
+            lg.setSourceText(src);
+            lg.debug("proxy_protocol detected: src={s} consumed={d} replay={d}", .{
+                src,
+                parsed.consumed,
+                replay.len,
+            });
+        } else {
+            lg.debug("proxy_protocol detected: consumed={d} replay={d}", .{
+                parsed.consumed,
+                replay.len,
+            });
+        }
+    } else if (proxyProtocolNeedMore(probe_buf[0..total])) {
+        lg.warn("proxy_protocol candidate incomplete/invalid, fallback replay={d}", .{replay.len});
+    }
+
+    return storage.prefixed_transport.transport();
+}
+
+fn proxyProtocolNeedMore(data: []const u8) bool {
+    const v2_sig = [12]u8{ 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A };
+    const v1_prefix = "PROXY ";
+
+    if (isPrefix(data, &v2_sig)) return true;
+    if (data.len >= v2_sig.len and std.mem.eql(u8, data[0..v2_sig.len], &v2_sig)) {
+        if (data.len < 16) return true;
+        const addr_len = (@as(usize, data[14]) << 8) | @as(usize, data[15]);
+        return data.len < 16 + addr_len;
+    }
+
+    if (isPrefix(data, v1_prefix)) return true;
+    if (data.len >= v1_prefix.len and std.mem.eql(u8, data[0..v1_prefix.len], v1_prefix)) {
+        return std.mem.indexOf(u8, data, "\r\n") == null;
+    }
+
+    return false;
+}
+
+fn isPrefix(data: []const u8, full: []const u8) bool {
+    if (data.len > full.len) return false;
+    return std.mem.eql(u8, data, full[0..data.len]);
+}
+
+fn formatProxySource(parsed: proxy_protocol.ParseResult, out: *[96]u8) ?[]const u8 {
+    if (parsed.src_ip4 == null and parsed.src_ip6 == null) return null;
+
+    var ip_buf: [64]u8 = undefined;
+    const ip = proxy_protocol.fmtIp(parsed, &ip_buf);
+    if (parsed.src_ip6 != null) {
+        return std.fmt.bufPrint(out, "[{s}]:{d}", .{ ip, parsed.src_port }) catch null;
+    }
+    return std.fmt.bufPrint(out, "{s}:{d}", .{ ip, parsed.src_port }) catch null;
 }
 
 fn buildOutboundTransport(
@@ -394,9 +520,11 @@ fn buildOutboundTransport(
     var current = storage.raw.transport();
 
     const oc = out_config orelse return current;
+    const need_out_tls = (oc.transport == .tls or oc.transport == .wss) or oc.tls;
+    const need_out_ws = (oc.transport == .ws or oc.transport == .wss);
 
     // Outbound TLS
-    if (oc.transport == .tls or oc.transport == .wss) {
+    if (need_out_tls) {
         lg.debug("outbound TLS handshake starting", .{});
         out_tls_ctx.* = tls_mod.TlsContext.initClient() catch return error.OutTlsInitFailed;
         out_tls_ctx.*.?.configureOutbound(
@@ -417,7 +545,7 @@ fn buildOutboundTransport(
     }
 
     // Outbound WebSocket
-    if (oc.transport == .ws or oc.transport == .wss) {
+    if (need_out_ws) {
         lg.debug("outbound WS handshake starting", .{});
         out_ws_storage.* = ws_mod.WsStream.initClient(
             oc.ws_path_buf[0..oc.ws_path_len],
@@ -531,6 +659,7 @@ fn parseProtocol(
         &bufs.up_dec,
         &bufs.payload,
         hs_timeout,
+        lg,
     );
     lg.debug("proto: parsed udp={} payload={d}B decrypted={}", .{
         parsed.is_udp, parsed.action.payload_len, parsed.action.payload_is_decrypted,
@@ -725,8 +854,97 @@ fn relayDirection(
                             consumed += s.bytes_consumed;
                             chunks += 1;
                         },
-                        .incomplete => break,
-                        .integrity_error => return error.DecryptFailed,
+                        .incomplete => {
+                            if (consumed == 0 and accum == read_buf.len) {
+                                const sample_len = @min(error_sample_bytes, accum);
+                                lg.warn(tag ++ ": decoder incomplete with full buffer read={d}B accum={d} dec_noop={} enc_noop={} sample={x}", .{
+                                    n,
+                                    accum,
+                                    decoder.is_noop,
+                                    encoder.is_noop,
+                                    read_buf[0..sample_len],
+                                });
+                            }
+                            break;
+                        },
+                        .integrity_error => {
+                            const pending = accum - consumed;
+                            const sample_len = @min(error_sample_bytes, pending);
+                            if (decoder.decryptDebug()) |dbg| switch (dbg) {
+                                .vmess => |v| {
+                                    if (sample_len > 0) {
+                                        lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending={d} proto=vmess reason={s} sec={s} nonce={d} size_nonce={d} auth_len={} mask={} padding={} data_len={d} size_field={d} total_payload={d} padding_len={d} enc_len={d} tag_len={d} wire_len={d} sample={x}", .{
+                                            chunks + 1,
+                                            total_bytes,
+                                            n,
+                                            accum,
+                                            consumed,
+                                            pending,
+                                            @tagName(v.kind),
+                                            @tagName(v.security),
+                                            v.nonce_counter,
+                                            v.auth_length_nonce_counter,
+                                            v.auth_length,
+                                            v.chunk_masking,
+                                            v.global_padding,
+                                            v.data_len,
+                                            v.size_field_len,
+                                            v.total_payload,
+                                            v.padding_len,
+                                            v.enc_len,
+                                            v.tag_len,
+                                            v.wire_len,
+                                            read_buf[consumed .. consumed + sample_len],
+                                        });
+                                    } else {
+                                        lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending=0 proto=vmess reason={s} sec={s} nonce={d} size_nonce={d} auth_len={} mask={} padding={} data_len={d} size_field={d} total_payload={d} padding_len={d} enc_len={d} tag_len={d} wire_len={d}", .{
+                                            chunks + 1,
+                                            total_bytes,
+                                            n,
+                                            accum,
+                                            consumed,
+                                            @tagName(v.kind),
+                                            @tagName(v.security),
+                                            v.nonce_counter,
+                                            v.auth_length_nonce_counter,
+                                            v.auth_length,
+                                            v.chunk_masking,
+                                            v.global_padding,
+                                            v.data_len,
+                                            v.size_field_len,
+                                            v.total_payload,
+                                            v.padding_len,
+                                            v.enc_len,
+                                            v.tag_len,
+                                            v.wire_len,
+                                        });
+                                    }
+                                },
+                            } else if (sample_len > 0) {
+                                lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending={d} dec_noop={} enc_noop={} sample={x}", .{
+                                    chunks + 1,
+                                    total_bytes,
+                                    n,
+                                    accum,
+                                    consumed,
+                                    pending,
+                                    decoder.is_noop,
+                                    encoder.is_noop,
+                                    read_buf[consumed .. consumed + sample_len],
+                                });
+                            } else {
+                                lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending=0 dec_noop={} enc_noop={}", .{
+                                    chunks + 1,
+                                    total_bytes,
+                                    n,
+                                    accum,
+                                    consumed,
+                                    decoder.is_noop,
+                                    encoder.is_noop,
+                                });
+                            }
+                            return error.DecryptFailed;
+                        },
                     }
                 }
             }

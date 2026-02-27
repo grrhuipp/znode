@@ -19,6 +19,10 @@ pub const DecryptResult = union(enum) {
     integrity_error,
 };
 
+pub const DecryptDebugInfo = union(enum) {
+    vmess: vmess_stream.DecryptDebugInfo,
+};
+
 /// Unified codec interface — protocol layer uses only this.
 pub const Codec = struct {
     ptr: *anyopaque,
@@ -28,6 +32,7 @@ pub const Codec = struct {
     pub const VTable = struct {
         encryptFn: *const fn (ptr: *anyopaque, plaintext: []const u8, out: []u8) ?usize,
         decryptFn: *const fn (ptr: *anyopaque, data: []const u8, out: []u8) DecryptResult,
+        decryptDebugFn: *const fn (ptr: *anyopaque) ?DecryptDebugInfo,
     };
 
     pub inline fn encrypt(self: Codec, plaintext: []const u8, out: []u8) ?usize {
@@ -36,6 +41,10 @@ pub const Codec = struct {
 
     pub inline fn decrypt(self: Codec, data: []const u8, out: []u8) DecryptResult {
         return self.vtable.decryptFn(self.ptr, data, out);
+    }
+
+    pub inline fn decryptDebug(self: Codec) ?DecryptDebugInfo {
+        return self.vtable.decryptDebugFn(self.ptr);
     }
 
     /// Passthrough codec — no encryption/decryption.
@@ -48,6 +57,7 @@ pub const Codec = struct {
     const noop_vtable = VTable{
         .encryptFn = noopEncrypt,
         .decryptFn = noopDecrypt,
+        .decryptDebugFn = noopDecryptDebug,
     };
 
     fn noopEncrypt(_: *anyopaque, plaintext: []const u8, _: []u8) ?usize {
@@ -56,6 +66,10 @@ pub const Codec = struct {
 
     fn noopDecrypt(_: *anyopaque, data: []const u8, _: []u8) DecryptResult {
         return .{ .success = .{ .plaintext_len = data.len, .bytes_consumed = data.len } };
+    }
+
+    fn noopDecryptDebug(_: *anyopaque) ?DecryptDebugInfo {
+        return null;
     }
 };
 
@@ -78,6 +92,7 @@ pub const VMessCodec = struct {
     const vmess_vtable = Codec.VTable{
         .encryptFn = vmessEncrypt,
         .decryptFn = vmessDecrypt,
+        .decryptDebugFn = vmessDecryptDebug,
     };
 
     pub fn codec(self: *VMessCodec) Codec {
@@ -98,6 +113,12 @@ pub const VMessCodec = struct {
             .integrity_error => .integrity_error,
         };
     }
+
+    fn vmessDecryptDebug(ptr: *anyopaque) ?DecryptDebugInfo {
+        const self: *VMessCodec = @ptrCast(@alignCast(ptr));
+        const info = self.state.lastDecryptError() orelse return null;
+        return .{ .vmess = info };
+    }
 };
 
 // ── Shadowsocks Codec Adapter ──
@@ -108,6 +129,7 @@ pub const SsCodec = struct {
     const ss_vtable = Codec.VTable{
         .encryptFn = ssEncrypt,
         .decryptFn = ssDecrypt,
+        .decryptDebugFn = ssDecryptDebug,
     };
 
     pub fn codec(self: *SsCodec) Codec {
@@ -127,5 +149,9 @@ pub const SsCodec = struct {
             .incomplete => .incomplete,
             .integrity_error => .integrity_error,
         };
+    }
+
+    fn ssDecryptDebug(_: *anyopaque) ?DecryptDebugInfo {
+        return null;
     }
 };

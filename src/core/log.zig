@@ -508,6 +508,17 @@ pub const ScopedLogger = struct {
         self.src_len = @intCast(s.len);
     }
 
+    /// Set source string directly (e.g. when resolved from PROXY protocol).
+    pub fn setSourceText(self: *ScopedLogger, src: []const u8) void {
+        const n: usize = @min(src.len, self.src_buf.len);
+        if (n == 0) {
+            self.src_len = 0;
+            return;
+        }
+        @memcpy(self.src_buf[0..n], src[0..n]);
+        self.src_len = @intCast(n);
+    }
+
     pub fn debug(self: ScopedLogger, comptime fmt: []const u8, args: anytype) void {
         self.log(.debug, fmt, args);
     }

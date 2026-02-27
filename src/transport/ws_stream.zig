@@ -28,6 +28,24 @@ pub const WsResult = @import("stream.zig").TransportResult;
 
 pub const Role = enum { server, client };
 
+pub const BufferDebugState = struct {
+    handshake_done: bool,
+    hs_len: usize,
+    leftover_start: usize,
+    available: usize,
+    input_space: usize,
+    out_pending: usize,
+    has_frame_header: bool = false,
+    frame_fin: bool = false,
+    frame_opcode: u8 = 0,
+    frame_masked: bool = false,
+    frame_payload_len: u64 = 0,
+    frame_header_size: usize = 0,
+    frame_total_size: usize = 0,
+    frame_complete: bool = false,
+    parse_blocked: bool = false,
+};
+
 /// WebSocket transport layer following the TLS Stream transformation pattern.
 ///
 /// Data flow: TCP <-> [TLS] <-> WS <-> Protocol (VMess/Trojan)
@@ -44,8 +62,13 @@ pub const WsStream = struct {
     host_buf: [128]u8 = undefined,
     host_len: u8 = 0,
 
-    // Handshake accumulation buffer (HTTP headers can arrive fragmented)
-    hs_buf: [4096]u8 = undefined,
+    // Shared input buffer:
+    // - handshake stage: HTTP Upgrade headers
+    // - data stage: WS frame accumulation
+    //
+    // 4KB is too small for common VMess/Trojan-over-WS frame sizes and can
+    // trigger WsFrameBufferFull under normal client behavior.
+    hs_buf: [32 * 1024]u8 = undefined,
     hs_len: usize = 0,
 
     // Output buffer (handshake response / control frames)
@@ -213,8 +236,54 @@ pub const WsStream = struct {
         return self.out_len > self.out_pos;
     }
 
+    /// Remaining capacity of internal input buffer.
+    /// Used by transport wrapper to avoid dropping bytes on large socket reads.
+    pub fn inputSpace(self: *const WsStream) usize {
+        return self.hs_buf.len - self.hs_len;
+    }
+
     pub fn isHandshakeDone(self: *const WsStream) bool {
         return self.handshake_done;
+    }
+
+    /// Snapshot current frame-buffer state for diagnostics.
+    pub fn debugState(self: *const WsStream) BufferDebugState {
+        const available = self.hs_len - @min(self.leftover_start, self.hs_len);
+        var state = BufferDebugState{
+            .handshake_done = self.handshake_done,
+            .hs_len = self.hs_len,
+            .leftover_start = self.leftover_start,
+            .available = available,
+            .input_space = self.inputSpace(),
+            .out_pending = self.out_len - self.out_pos,
+        };
+
+        if (!self.handshake_done or available == 0) return state;
+
+        const view = self.hs_buf[self.leftover_start..self.hs_len];
+        if (parseFrameHeader(view)) |hdr| {
+            state.has_frame_header = true;
+            state.frame_fin = hdr.fin;
+            state.frame_opcode = @intFromEnum(hdr.opcode);
+            state.frame_masked = hdr.masked;
+            state.frame_payload_len = hdr.payload_len;
+            state.frame_header_size = hdr.header_size;
+
+            const payload_len: usize = if (hdr.payload_len > std.math.maxInt(usize))
+                std.math.maxInt(usize)
+            else
+                @as(usize, @intCast(hdr.payload_len));
+
+            const total_max = std.math.maxInt(usize);
+            state.frame_total_size = if (payload_len > total_max - hdr.header_size)
+                total_max
+            else
+                hdr.header_size + payload_len;
+            state.frame_complete = available >= state.frame_total_size;
+        } else {
+            state.parse_blocked = true;
+        }
+        return state;
     }
 
     // ── Server handshake ──

@@ -11,6 +11,7 @@ const config_mod = @import("core/config.zig");
 const Worker = @import("core/worker.zig").Worker;
 const Dispatcher = @import("core/dispatcher.zig").Dispatcher;
 const session_handler = @import("core/session_handler.zig");
+const ip_error_ban_mod = @import("core/ip_error_ban.zig");
 const stats_mod = @import("core/stats.zig");
 const api_client_mod = @import("panel/api_client.zig");
 const self_signed = @import("transport/self_signed.zig");
@@ -407,8 +408,22 @@ fn appMain() !void {
     var shared = session_handler.Shared{
         .allocator = allocator,
         .router = &router,
+        .ip_error_ban = ip_error_ban_mod.IpErrorBan.init(
+            config.ip_error_ban_threshold,
+            config.ip_error_ban_window_sec,
+            config.ip_error_ban_duration_sec,
+        ),
         .buf_pool = session_handler.BufPool.init(allocator),
     };
+    if (shared.ip_error_ban.enabled()) {
+        log.info("ip_error_ban enabled: {d} errors/{d}s -> ban {d}s", .{
+            shared.ip_error_ban.threshold(),
+            shared.ip_error_ban.windowSeconds(),
+            shared.ip_error_ban.banSeconds(),
+        });
+    } else {
+        log.info("ip_error_ban disabled", .{});
+    }
     // Drain cached session buffers before allocator teardown.
     // Keep this defer above rt.deinit so runtime shutdown runs first.
     defer shared.buf_pool.deinit();
@@ -450,6 +465,7 @@ fn buildWorkerListenerInfo(
         .user_store = store,
         .sniff_enabled = entry.sniff_enabled,
         .sniff_redirect = entry.sniff_redirect,
+        .transport = server_info.transport,
     };
     {
         const proto_str = @tagName(entry.protocol);
@@ -476,6 +492,11 @@ fn buildWorkerListenerInfo(
         if (parseIpv4(entry.getFallbackAddr(), &fb_ip4)) {
             info.fallback_addr = std.net.Address.initIp4(fb_ip4, entry.fallback_port);
         }
+    }
+    if (server_info.ws_path_len > 0) {
+        const wp_n: u8 = @intCast(@min(server_info.ws_path_len, info.ws_path_buf.len));
+        @memcpy(info.ws_path_buf[0..wp_n], server_info.ws_path_buf[0..wp_n]);
+        info.ws_path_len = wp_n;
     }
     if (entry.protocol == .shadowsocks and entry.ss_password_len > 0 and entry.ss_method_len > 0) {
         if (ss_crypto.Method.fromString(entry.getSsMethod())) |method| {

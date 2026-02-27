@@ -516,6 +516,11 @@ pub const RouteEntry = struct {
 pub const Config = struct {
     log_level: log.Level = .info,
     workers: u16 = 0, // 0 = auto-detect CPU count
+    // Per-IP error ban (default: 15 errors / 60s -> ban 300s)
+    // threshold=0 disables this feature.
+    ip_error_ban_threshold: u16 = 15,
+    ip_error_ban_window_sec: u16 = 60,
+    ip_error_ban_duration_sec: u16 = 300,
 
     // Panel entries (each connects to a panel + listens locally)
     panel: []const NodeConfig = &.{},
@@ -917,6 +922,12 @@ fn applyRootKV(config: *Config, key: []const u8, val: []const u8) void {
         if (parseTomlBool(val)) |v| config.log_console = v;
     } else if (eql(u8, key, "workers")) {
         if (parseTomlInt(val)) |v| config.workers = @intCast(@max(0, @min(v, 64)));
+    } else if (eql(u8, key, "ip_error_ban_threshold") or eql(u8, key, "ip_ban_error_threshold")) {
+        if (parseTomlInt(val)) |v| config.ip_error_ban_threshold = @intCast(@max(0, @min(v, 10000)));
+    } else if (eql(u8, key, "ip_error_ban_window_sec") or eql(u8, key, "ip_ban_window_sec")) {
+        if (parseTomlInt(val)) |v| config.ip_error_ban_window_sec = @intCast(@max(0, @min(v, 86400)));
+    } else if (eql(u8, key, "ip_error_ban_duration_sec") or eql(u8, key, "ip_ban_duration_sec")) {
+        if (parseTomlInt(val)) |v| config.ip_error_ban_duration_sec = @intCast(@max(0, @min(v, 86400)));
     } else if (eql(u8, key, "geoip_path")) {
         Config.setPathField(&config.geoip_path, &config.geoip_path_len, parseTomlString(val));
     } else if (eql(u8, key, "geosite_path")) {
@@ -1251,6 +1262,9 @@ test "parseToml default config" {
     defer config.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 0), config.workers);
     try std.testing.expectEqual(log.Level.info, config.log_level);
+    try std.testing.expectEqual(@as(u16, 15), config.ip_error_ban_threshold);
+    try std.testing.expectEqual(@as(u16, 60), config.ip_error_ban_window_sec);
+    try std.testing.expectEqual(@as(u16, 300), config.ip_error_ban_duration_sec);
 }
 
 test "parseToml with workers" {
@@ -1262,6 +1276,19 @@ test "parseToml with workers" {
     defer config.deinit(allocator);
     try std.testing.expectEqual(@as(u16, 4), config.workers);
     try std.testing.expectEqual(log.Level.debug, config.log_level);
+}
+
+test "parseToml with ip error ban config" {
+    const allocator = std.testing.allocator;
+    var config = try parseToml(allocator,
+        \\ip_error_ban_threshold = 20
+        \\ip_error_ban_window_sec = 90
+        \\ip_error_ban_duration_sec = 600
+    );
+    defer config.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 20), config.ip_error_ban_threshold);
+    try std.testing.expectEqual(@as(u16, 90), config.ip_error_ban_window_sec);
+    try std.testing.expectEqual(@as(u16, 600), config.ip_error_ban_duration_sec);
 }
 
 test "parseToml with log config" {
