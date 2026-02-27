@@ -159,6 +159,9 @@ pub const GeoUpdater = struct {
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &fw.interface,
+            .extra_headers = &.{
+                .{ .name = "Accept-Encoding", .value = "identity" },
+            },
         }) catch |e| {
             self.logger.err("{s}: download failed: {s} url={s}", .{ name, @errorName(e), url });
             tmp_file.close();

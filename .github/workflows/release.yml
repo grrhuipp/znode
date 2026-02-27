@@ -17,11 +17,6 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Patch Zig std library
-        run: |
-          ZIG_LIB="$(dirname $(which zig))/lib"
-          cp patches/std/compress/flate/Decompress.zig "$ZIG_LIB/std/compress/flate/Decompress.zig"
-
       - name: Cache Zig build artifacts
         uses: actions/cache@v4
         with:

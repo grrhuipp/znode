@@ -179,6 +179,9 @@ pub const ApiClient = struct {
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &aw.writer,
+            .extra_headers = &.{
+                .{ .name = "Accept-Encoding", .value = "identity" },
+            },
         }) catch |e| {
             var err_list = aw.toArrayList();
             const partial = err_list.items;
