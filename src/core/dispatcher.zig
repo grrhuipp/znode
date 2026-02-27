@@ -62,6 +62,11 @@ pub const Dispatcher = struct {
     pending_live: [max_pending_live]PendingLiveListener = undefined,
     pending_live_count: u8 = 0,
 
+    // Retry queue: bind failures re-queued here, retried next poll cycle.
+    // Only accessed from liveListenerLoop coroutine — no mutex needed.
+    retry_live: [max_pending_live]PendingLiveListener = undefined,
+    retry_live_count: u8 = 0,
+
     // Active servers (created in run() and processLiveListeners())
     servers: std.ArrayList(zio.net.Server) = .{},
 
@@ -218,25 +223,36 @@ pub const Dispatcher = struct {
     }
 
     fn processLiveListeners(self: *Dispatcher, group: *zio.Group) void {
-        // Snapshot pending queue under lock
+        // Snapshot new pending items under lock.
         self.pending_live_mutex.lock();
-        const count = self.pending_live_count;
-        var pending: [max_pending_live]PendingLiveListener = undefined;
-        if (count > 0) {
-            @memcpy(pending[0..count], self.pending_live[0..count]);
+        const new_count = self.pending_live_count;
+        var new_pending: [max_pending_live]PendingLiveListener = undefined;
+        if (new_count > 0) {
+            @memcpy(new_pending[0..new_count], self.pending_live[0..new_count]);
             self.pending_live_count = 0;
         }
         self.pending_live_mutex.unlock();
 
-        next_pending: for (pending[0..count]) |*pl| {
+        // Build combined batch: previous retry items first, then freshly queued items.
+        // Both arrays are bounded by max_pending_live, so the combined size fits in 2×.
+        var batch: [max_pending_live * 2]PendingLiveListener = undefined;
+        const retry_count = self.retry_live_count;
+        if (retry_count > 0) @memcpy(batch[0..retry_count], self.retry_live[0..retry_count]);
+        if (new_count > 0) @memcpy(batch[retry_count .. retry_count + new_count], new_pending[0..new_count]);
+        const total = retry_count + new_count;
+        self.retry_live_count = 0; // reset; failures below will re-populate
+
+        next_pending: for (batch[0..total]) |*pl| {
+            if (self.stopping) return;
+
             const lid: u8 = @intCast(self.listeners.items.len);
 
             if (lid >= config_mod.max_listeners) {
-                self.logger.err("too many listeners (max {d}), skipping", .{config_mod.max_listeners});
+                self.logger.err("too many listeners (max {d}), dropping {s}", .{ config_mod.max_listeners, pl.tag[0..pl.tag_len] });
                 continue;
             }
 
-            // Duplicate port detection — prevents silent EADDRINUSE on bind
+            // Duplicate port detection — prevents silent EADDRINUSE on bind.
             for (self.listeners.items) |existing| {
                 if (existing.port == pl.port) {
                     self.logger.err("live listener port {d} already bound by lid={d}, skipping", .{ pl.port, existing.listener_id });
@@ -244,18 +260,24 @@ pub const Dispatcher = struct {
                 }
             }
 
-            // Bind first — only commit the lid slot on success
+            // Bind first — only commit the lid slot on success.
             self.startListener(
                 pl.addr_buf[0..pl.addr_len],
                 pl.port,
                 lid,
                 group,
             ) catch |e| {
-                self.logger.err("live listener {s} failed: {}", .{ pl.tag[0..pl.tag_len], e });
+                self.logger.warn("live listener {s} bind failed ({s}), will retry next cycle", .{ pl.tag[0..pl.tag_len], @errorName(e) });
+                if (self.retry_live_count < max_pending_live) {
+                    self.retry_live[self.retry_live_count] = pl.*;
+                    self.retry_live_count += 1;
+                } else {
+                    self.logger.err("retry queue full, dropping listener {s}", .{pl.tag[0..pl.tag_len]});
+                }
                 continue;
             };
 
-            // Bind succeeded — commit listener info and register slot
+            // Bind succeeded — commit listener info and register slot.
             self.listener_infos[lid] = pl.worker_info;
             self.listener_info_count.* = @max(self.listener_info_count.*, lid + 1);
 
@@ -270,7 +292,6 @@ pub const Dispatcher = struct {
             self.listeners.append(self.allocator, listener) catch {
                 self.logger.err("OOM registering live listener lid={d}", .{lid});
             };
-
         }
     }
 
