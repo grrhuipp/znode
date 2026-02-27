@@ -14,7 +14,6 @@ const ip_error_ban_mod = @import("ip_error_ban.zig");
 pub const Dispatcher = struct {
     // ── Type declarations ──
     const max_pending_live = 16;
-    const max_servers = 32;
 
     /// Pre-configured listener (address stored, server created in run()).
     pub const Listener = struct {
@@ -64,8 +63,7 @@ pub const Dispatcher = struct {
     pending_live_count: u8 = 0,
 
     // Active servers (created in run() and processLiveListeners())
-    servers: [max_servers]zio.net.Server = undefined,
-    server_count: u8 = 0,
+    servers: std.ArrayList(zio.net.Server) = .{},
 
     pub fn init(
         listener_infos: *[config_mod.max_listeners]Worker.ListenerInfo,
@@ -81,9 +79,8 @@ pub const Dispatcher = struct {
     }
 
     pub fn deinit(self: *Dispatcher) void {
-        for (self.servers[0..self.server_count]) |s| {
-            s.close();
-        }
+        for (self.servers.items) |s| s.close();
+        self.servers.deinit(self.allocator);
         self.listeners.deinit(self.allocator);
     }
 
@@ -136,10 +133,14 @@ pub const Dispatcher = struct {
     pub fn run(self: *Dispatcher) !void {
         self.session_group = zio.Group.init;
 
+        // Start async log writer (file I/O offloaded from worker coroutines).
+        try log.startAsync();
+
         var accept_group: zio.Group = .init;
         defer {
             accept_group.cancel(); // 1. Stop accepting new connections
             self.session_group.cancel(); // 2. Cancel all active sessions
+            log.drainAsync(); // 3. Flush remaining log entries to disk
         }
 
         // Create zio servers for pre-configured listeners
@@ -167,15 +168,12 @@ pub const Dispatcher = struct {
     // ── Internal: server lifecycle ──
 
     fn startListener(self: *Dispatcher, addr_str: []const u8, port: u16, listener_id: u8, group: *zio.Group) !void {
-        if (self.server_count >= max_servers) return error.Unexpected;
-
         const zio_addr = try parseZioAddress(addr_str, port);
         const server = try zio_addr.listen(.{ .reuse_address = true });
         errdefer server.close();
 
-        const sid = self.server_count;
-        self.servers[sid] = server;
-        self.server_count += 1;
+        const sid: u8 = @intCast(self.servers.items.len);
+        try self.servers.append(self.allocator, server);
 
         try group.spawn(acceptLoop, .{ self, sid, listener_id });
     }
@@ -187,7 +185,7 @@ pub const Dispatcher = struct {
 
         while (true) {
             self.logger.debug("acceptLoop waiting: sid={d} lid={d} total={d}", .{ server_idx, listener_id, self.total_accepted });
-            const stream = self.servers[server_idx].accept() catch |err| {
+            const stream = self.servers.items[server_idx].accept() catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 self.logger.err("accept error on lid={d}: {}", .{ listener_id, err });
                 continue;
@@ -230,7 +228,7 @@ pub const Dispatcher = struct {
         }
         self.pending_live_mutex.unlock();
 
-        for (pending[0..count]) |*pl| {
+        next_pending: for (pending[0..count]) |*pl| {
             const lid: u8 = @intCast(self.listeners.items.len);
 
             if (lid >= config_mod.max_listeners) {
@@ -238,11 +236,29 @@ pub const Dispatcher = struct {
                 continue;
             }
 
-            // Set listener info (canonical storage)
+            // Duplicate port detection — prevents silent EADDRINUSE on bind
+            for (self.listeners.items) |existing| {
+                if (existing.port == pl.port) {
+                    self.logger.err("live listener port {d} already bound by lid={d}, skipping", .{ pl.port, existing.listener_id });
+                    continue :next_pending;
+                }
+            }
+
+            // Bind first — only commit the lid slot on success
+            self.startListener(
+                pl.addr_buf[0..pl.addr_len],
+                pl.port,
+                lid,
+                group,
+            ) catch |e| {
+                self.logger.err("live listener {s} failed: {}", .{ pl.tag[0..pl.tag_len], e });
+                continue;
+            };
+
+            // Bind succeeded — commit listener info and register slot
             self.listener_infos[lid] = pl.worker_info;
             self.listener_info_count.* = @max(self.listener_info_count.*, lid + 1);
 
-            // Register in listeners list (for ID tracking)
             var listener = Listener{
                 .port = pl.port,
                 .listener_id = lid,
@@ -252,19 +268,7 @@ pub const Dispatcher = struct {
             @memcpy(listener.tag[0..pl.tag_len], pl.tag[0..pl.tag_len]);
             listener.tag_len = pl.tag_len;
             self.listeners.append(self.allocator, listener) catch {
-                self.logger.err("failed to register live listener lid={d}", .{lid});
-                continue;
-            };
-
-            // Create server and spawn accept loop
-            self.startListener(
-                pl.addr_buf[0..pl.addr_len],
-                pl.port,
-                lid,
-                group,
-            ) catch |e| {
-                self.logger.err("live listener {s} failed: {}", .{ pl.tag[0..pl.tag_len], e });
-                continue;
+                self.logger.err("OOM registering live listener lid={d}", .{lid});
             };
 
         }

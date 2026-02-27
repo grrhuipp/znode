@@ -610,7 +610,6 @@ fn buildInboundHandler(
                 .user_store = info.user_store,
                 .replay_filter = &shared.replay_filter,
                 .replay_mutex = &shared.replay_mutex,
-                .hot_cache = if (info.hot_cache.ttl > 0) @constCast(&info.hot_cache) else null,
                 .allocator = shared.allocator,
             };
             return storage.vmess.handler();

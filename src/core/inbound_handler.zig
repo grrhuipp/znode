@@ -24,7 +24,6 @@ const trojan_inbound = @import("../protocol/trojan/trojan_inbound.zig");
 const trojan_protocol = @import("../protocol/trojan/trojan_protocol.zig");
 const vmess_inbound = @import("../protocol/vmess/vmess_inbound.zig");
 const vmess_protocol = @import("../protocol/vmess/vmess_protocol.zig");
-const vmess_hot_cache = @import("../protocol/vmess/vmess_hot_cache.zig");
 const vmess_stream = @import("../protocol/vmess/vmess_stream.zig");
 const vmess_crypto = @import("../protocol/vmess/vmess_crypto.zig");
 const ss_inbound = @import("../protocol/shadowsocks/ss_inbound.zig");
@@ -122,7 +121,6 @@ fn debugVmessAuthFailure(
     lg: *Logger,
     users: *const user_store_mod.UserStore.UserMap,
     preamble: []const u8,
-    hot_cache_enabled: bool,
 ) void {
     if (!lg.enabled(.debug)) return;
     if (preamble.len < 42) return;
@@ -134,13 +132,12 @@ fn debugVmessAuthFailure(
     const enc_len_hex = bytesToHex(&enc_len_hex_buf, preamble[16..34]);
     const nonce_hex = bytesToHex(&nonce_hex_buf, preamble[34..42]);
 
-    lg.debug("vmess auth detail: auth_id={s} enc_len={s} nonce={s} users={d}/{d} hot_cache={}", .{
+    lg.debug("vmess auth detail: auth_id={s} enc_len={s} nonce={s} users={d}/{d}", .{
         auth_id_hex,
         enc_len_hex,
         nonce_hex,
         countEnabledUsers(users),
         users.users.len,
-        hot_cache_enabled,
     });
 }
 
@@ -284,7 +281,6 @@ pub const VMessInbound = struct {
     user_store: ?*user_store_mod.UserStore,
     replay_filter: *vmess_protocol.ReplayFilter,
     replay_mutex: *std.Thread.Mutex,
-    hot_cache: ?*vmess_hot_cache.HotCache,
     allocator: std.mem.Allocator,
 
     // Codec adapter storage — lifetime tied to this VMessInbound instance
@@ -303,9 +299,9 @@ pub const VMessInbound = struct {
 
     /// Streaming VMess parse:
     ///   1. readExact 42B preamble
-    ///   2. scan users → identify cmd_key + header_len  (hot_cache.mutex locked internally)
+    ///   2. scan users → identify cmd_key + header_len
     ///   3. readExact header_len+16 bytes
-    ///   4. decrypt header + replay check               (replay_mutex locked)
+    ///   4. decrypt header + replay check  (replay_mutex locked)
     ///   5. init StreamStates, encode 38B response header
     fn vmessParseStreaming(
         ptr: *anyopaque,
@@ -326,15 +322,12 @@ pub const VMessInbound = struct {
         const now = std.time.timestamp();
 
         // 2. Identify user + decode header length (does NOT check replay).
-        //    hot_cache locking is handled internally by HotCache methods; no external lock needed.
         const step1: vmess_protocol.StreamStep1Result = vmess_protocol.streamStep1(
             work_buf[0..42],
             users,
-            self.hot_cache,
-            self.allocator,
             now,
         ) orelse {
-            debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
+            debugVmessAuthFailure(lg, users, work_buf[0..42]);
             return error.VMessAuthFailed;
         };
 
@@ -358,7 +351,7 @@ pub const VMessInbound = struct {
                 .success => |r| break :blk r,
                 .incomplete => return error.VMessIncomplete,
                 .auth_failed => {
-                    debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
+                    debugVmessAuthFailure(lg, users, work_buf[0..42]);
                     return error.VMessAuthFailed;
                 },
                 .replay_detected => return error.VMessReplay,

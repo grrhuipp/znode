@@ -176,6 +176,91 @@ fn ymdToEpochDay(y_in: u16, m_in: u8, d_in: u8) i32 {
     return era * 146097 + doe - 719468;
 }
 
+// ── Async log writer ──
+
+/// Fixed-size log message for zero-allocation channel transport.
+/// Workers copy pre-formatted lines here; the writer coroutine flushes to disk.
+const LOG_MSG_DATA_SIZE: usize = 512;
+const LOG_CHANNEL_DEPTH: usize = 256;
+
+const LogMsg = struct {
+    data: [LOG_MSG_DATA_SIZE]u8 = undefined,
+    len: u16 = 0,
+    year: u16 = 1970,
+    month: u8 = 1,
+    day: u8 = 1,
+    epoch_day: i32 = 0,
+    dest: u8 = 0, // 0 = access, 1 = error, 2 = app
+};
+
+var g_log_msg_buf: [LOG_CHANNEL_DEPTH]LogMsg = undefined;
+var g_log_channel: zio.Channel(LogMsg) = undefined;
+var g_async_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var g_writer_group: zio.Group = .init;
+
+const dest_names = [3][]const u8{ "access", "error", "app" };
+
+/// Thread-pool worker: blocking writeAll on a std.fs.File. Called via zio.blockInPlace.
+fn doFileWrite(file: std.fs.File, data: []const u8) void {
+    file.writeAll(data) catch {};
+}
+
+/// Dedicated writer coroutine: owns all log file handles and writes asynchronously.
+/// Worker coroutines only copy into LogMsg and trySend — zero file I/O on the hot path.
+/// Each write is submitted to zio's thread pool via blockInPlace, so the executor
+/// thread is free to run other coroutines while disk I/O is in progress.
+fn logWriterCoroutine() void {
+    var files: [3]?std.fs.File = .{ null, null, null };
+    var current_days: [3]i32 = .{ -1, -1, -1 };
+
+    defer for (0..3) |i| {
+        if (files[i]) |f| f.close();
+    };
+
+    while (true) {
+        const msg = g_log_channel.receive() catch break;
+        const d = msg.dest;
+        if (d >= 3 or g_state.log_dir_len == 0) continue;
+
+        // File rotation when the calendar day changes (rare: once per day).
+        if (msg.epoch_day != current_days[d]) {
+            if (files[d]) |f| {
+                f.close();
+                files[d] = null;
+            }
+            var path_buf: [512]u8 = undefined;
+            const dir = g_state.log_dir_buf[0..g_state.log_dir_len];
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}_{d:0>4}-{d:0>2}-{d:0>2}.log", .{
+                dir, dest_names[d], msg.year, msg.month, msg.day,
+            }) catch continue;
+            files[d] = openAppendFile(path); // sync open is fine (rotation is rare)
+            current_days[d] = msg.epoch_day;
+        }
+
+        // Async write: submits to zio thread pool, suspends coroutine until done.
+        // The executor thread is released to run other coroutines during I/O.
+        if (files[d]) |f| {
+            zio.blockInPlace(doFileWrite, .{ f, msg.data[0..msg.len] });
+        }
+    }
+}
+
+/// Start the async log writer coroutine. Must be called from within a zio runtime context.
+pub fn startAsync() !void {
+    g_writer_group = .init;
+    g_log_channel = zio.Channel(LogMsg).init(g_log_msg_buf[0..]);
+    g_async_active.store(true, .release);
+    try g_writer_group.spawn(logWriterCoroutine, .{});
+}
+
+/// Drain pending log entries and stop the writer. Must be called from a zio coroutine.
+/// Waits until all buffered messages are written to disk before returning.
+pub fn drainAsync() void {
+    if (!g_async_active.swap(false, .acq_rel)) return;
+    g_log_channel.close(.graceful); // writer drains remaining entries then exits
+    g_writer_group.wait() catch {}; // await writer coroutine completion
+}
+
 // ── Channel (per-log-channel state) ──
 
 const Channel = struct {
@@ -185,26 +270,41 @@ const Channel = struct {
     prefix_buf: [16]u8 = [_]u8{0} ** 16,
     prefix_len: u8 = 0,
     write_console: bool = false,
+    /// Destination index for async routing: 0=access, 1=error, 2=app.
+    dest_id: u8 = 0,
 
     fn writeLine(self: *Channel, line: []const u8, parts: TimeParts) void {
-        const write_console = self.write_console;
+        // Console output: always immediate (not batched through async writer).
+        if (self.write_console) {
+            g_console_mutex.lock();
+            defer g_console_mutex.unlock();
+            std.debug.print("{s}", .{line});
+        }
 
-        self.mutex.lock();
+        if (g_async_active.load(.acquire)) {
+            // Async path: hand off to writer coroutine (non-blocking).
+            var msg = LogMsg{
+                .dest = self.dest_id,
+                .year = parts.year,
+                .month = parts.month,
+                .day = parts.day,
+                .epoch_day = parts.epoch_day,
+            };
+            const n: u16 = @intCast(@min(line.len, LOG_MSG_DATA_SIZE));
+            @memcpy(msg.data[0..n], line[0..n]);
+            msg.len = n;
+            g_log_channel.trySend(msg) catch {}; // drop if channel full
+            return;
+        }
 
-        // Write to file (rotate if needed)
+        // Sync fallback: used before startAsync() (early startup logging).
         if (g_state.log_dir_len > 0) {
+            self.mutex.lock();
             self.ensureFile(parts);
             if (self.file) |f| {
                 f.writeAll(line) catch {};
             }
-        }
-        self.mutex.unlock();
-
-        // Keep file lock free from slow console I/O.
-        if (write_console) {
-            g_console_mutex.lock();
-            defer g_console_mutex.unlock();
-            std.debug.print("{s}", .{line});
+            self.mutex.unlock();
         }
     }
 
@@ -265,16 +365,19 @@ var g_state = struct {
         .prefix_buf = comptimePad("app", 16),
         .prefix_len = 3,
         .write_console = true,
+        .dest_id = 2,
     },
     access_ch: Channel = .{
         .prefix_buf = comptimePad("access", 16),
         .prefix_len = 6,
         .write_console = false,
+        .dest_id = 0,
     },
     error_ch: Channel = .{
         .prefix_buf = comptimePad("error", 16),
         .prefix_len = 5,
         .write_console = false,
+        .dest_id = 1,
     },
 }{};
 var g_console_mutex: std.Thread.Mutex = .{};

@@ -2,7 +2,6 @@ const std = @import("std");
 const Session = @import("../../core/session.zig");
 const user_store = @import("../../core/user_store.zig");
 const vmess_crypto = @import("vmess_crypto.zig");
-const vmess_hot_cache = @import("vmess_hot_cache.zig");
 const boringssl = @import("../../crypto/boringssl_crypto.zig");
 const Aes128Gcm = boringssl.Aes128Gcm;
 /// Constant-time comparison to prevent timing side-channels.
@@ -146,7 +145,6 @@ pub fn parseRequest(
     data: []const u8,
     user_map: *const user_store.UserStore.UserMap,
     replay_filter: *ReplayFilter,
-    hot_cache: ?*vmess_hot_cache.HotCache,
     allocator: std.mem.Allocator,
 ) ParseResult {
     if (data.len < 42) return .incomplete;
@@ -157,23 +155,6 @@ pub fn parseRequest(
 
     const now = std.time.timestamp();
 
-    // ── Fast path: try hot cache first ──
-    if (hot_cache) |cache| {
-        if (cache.tryAuth(auth_id, now, allocator)) |hit| {
-            // Verify user still exists in current UserMap
-            if (user_map.findById(hit.user_id)) |user| {
-                if (user.enabled) {
-                    if (tryDecryptHeader(data, hit.cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user, allocator)) |result| {
-                        return result;
-                    }
-                }
-            }
-            // User removed or decrypt failed → evict from cache
-            cache.evictUser(hit.user_id, allocator);
-        }
-    }
-
-    // ── Slow path: full scan with pre-cached keys ──
     for (user_map.users) |*user| {
         if (!user.enabled) continue;
 
@@ -186,10 +167,6 @@ pub fn parseRequest(
         _ = ts;
 
         if (tryDecryptHeader(data, cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user, allocator)) |result| {
-            // Record in hot cache on successful auth from slow path
-            if (hot_cache) |cache| {
-                cache.recordAuth(user.id, cmd_key, auth_key, now, allocator, @max(1, user_map.users.len / 10));
-            }
             return result;
         }
     }
@@ -744,41 +721,21 @@ pub const StreamStep1Result = struct {
 
 /// Streaming step 1: scan users + decode header length from the 42-byte preamble.
 /// Returns null if no user matches (auth failed).
-/// HotCache locking is handled internally by HotCache.tryAuth / recordAuth / evictUser;
-/// callers do NOT need to hold any external lock for this function.
 pub fn streamStep1(
     preamble: *const [42]u8,
     user_map: *const user_store.UserStore.UserMap,
-    hot_cache: ?*vmess_hot_cache.HotCache,
-    allocator: std.mem.Allocator,
     now: i64,
 ) ?StreamStep1Result {
     const auth_id: vmess_crypto.AuthID = preamble[0..16].*;
     const enc_length_block = preamble[16..34];
     const connection_nonce: [8]u8 = preamble[34..42].*;
 
-    // Fast path: hot cache
-    if (hot_cache) |cache| {
-        if (cache.tryAuth(auth_id, now, allocator)) |hit| {
-            if (user_map.findById(hit.user_id)) |user| {
-                if (user.enabled) {
-                    if (tryPeekHeaderLen(enc_length_block, hit.cmd_key, auth_id, connection_nonce)) |header_len| {
-                        return .{ .header_len = header_len, .cmd_key = hit.cmd_key, .auth_id = auth_id, .connection_nonce = connection_nonce, .user = user };
-                    }
-                }
-            }
-            cache.evictUser(hit.user_id, allocator);
-        }
-    }
-
-    // Slow path: full user scan
     for (user_map.users) |*user| {
         if (!user.enabled) continue;
         const auth_key = user.cached_auth_key;
         _ = vmess_crypto.validateAuthId(auth_id, auth_key, now) orelse continue;
         const cmd_key = user.cached_cmd_key;
         if (tryPeekHeaderLen(enc_length_block, cmd_key, auth_id, connection_nonce)) |header_len| {
-            if (hot_cache) |cache| cache.recordAuth(user.id, cmd_key, auth_key, now, allocator, @max(1, user_map.users.len / 10));
             return .{ .header_len = header_len, .cmd_key = cmd_key, .auth_id = auth_id, .connection_nonce = connection_nonce, .user = user };
         }
     }

@@ -12,7 +12,6 @@ const std = @import("std");
 const vmess_protocol = @import("vmess_protocol.zig");
 const vmess_stream = @import("vmess_stream.zig");
 const vmess_crypto = @import("vmess_crypto.zig");
-const vmess_hot_cache = @import("vmess_hot_cache.zig");
 const config_mod = @import("../../core/config.zig");
 const conn_types = @import("../../core/conn_types.zig");
 const user_store_mod = @import("../../core/user_store.zig");
@@ -29,13 +28,12 @@ pub fn parseInbound(
     buf: []const u8,
     user_map: ?*const user_store_mod.UserStore.UserMap,
     replay_filter: *vmess_protocol.ReplayFilter,
-    hot_cache: ?*vmess_hot_cache.HotCache,
     allocator: std.mem.Allocator,
     payload_out: []u8,
 ) InboundResult {
     if (user_map == null) return .{ .close = .proto_err };
 
-    switch (vmess_protocol.parseRequest(buf, user_map.?, replay_filter, hot_cache, allocator)) {
+    switch (vmess_protocol.parseRequest(buf, user_map.?, replay_filter, allocator)) {
         .success => |req| {
             const user_id: i64 = if (req.matched_user) |u| u.id else -1;
 

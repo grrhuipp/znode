@@ -2,7 +2,6 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const tls_mod = @import("../transport/tls_stream.zig");
 const user_store_mod = @import("user_store.zig");
-const vmess_hot_cache = @import("../protocol/vmess/vmess_hot_cache.zig");
 
 /// Worker namespace — retained for ListenerInfo type definitions used by
 /// dispatcher, session_handler, and main.zig.
@@ -20,8 +19,6 @@ pub const Worker = struct {
         // Per-panel context (set by main.zig for each panel's listener)
         tls_ctx: ?*tls_mod.TlsContext = null,
         user_store: ?*user_store_mod.UserStore = null,
-        // VMess hot user cache (per-listener isolation for multi-panel)
-        hot_cache: vmess_hot_cache.HotCache = vmess_hot_cache.HotCache.init(vmess_hot_cache.HotCache.default_ttl),
         // Shadowsocks inbound credentials (optional, set when protocol == .shadowsocks)
         ss_inbound: ?SsInbound = null,
         // Sniff: detect TLS SNI / HTTP Host from initial payload

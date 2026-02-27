@@ -199,13 +199,6 @@ fn appMain() !void {
         log.info("routes: {d} entries", .{config.routes.len});
     }
 
-    defer {
-        // Deinit hot caches stored in canonical listener_infos
-        for (listener_infos[0..listener_info_count]) |*info| {
-            info.hot_cache.deinit(allocator);
-        }
-    }
-
     // Create dispatcher (heap-allocated — contains server arrays)
     const dispatcher = try allocator.create(Dispatcher);
     defer allocator.destroy(dispatcher);
@@ -703,7 +696,6 @@ test {
     _ = @import("transport/ws_stream.zig");
     _ = @import("protocol/trojan/trojan_protocol.zig");
     _ = @import("protocol/vmess/vmess_crypto.zig");
-    _ = @import("protocol/vmess/vmess_hot_cache.zig");
     _ = @import("protocol/vmess/vmess_protocol.zig");
     _ = @import("protocol/vmess/vmess_stream.zig");
     _ = @import("protocol/vmess/xudp_mux.zig");
