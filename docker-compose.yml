@@ -1,0 +1,15 @@
+services:
+  znode:
+    image: ${DOCKERHUB_USERNAME:-grrhuipp}/znode:latest
+    container_name: znode
+    restart: unless-stopped
+    network_mode: host          # 代理服务通常需要 host 网络直接绑端口
+    volumes:
+      - ./config:/etc/znode     # 挂载本地 config/ 目录
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
