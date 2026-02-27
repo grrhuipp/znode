@@ -370,8 +370,8 @@ pub fn decryptChunk(state: *StreamState, data: []const u8, out_buf: []u8) Decryp
 
     const tag_len = tagLength(state.security);
 
-    // Chunk size limit (16KB + 64 padding max)
-    if (total_payload > vmess_crypto.max_chunk_size + 64) {
+    // Chunk size limit: bounded by VMess 2-byte size field width.
+    if (total_payload > vmess_crypto.max_chunk_size) {
         state.pending_decode = null;
         return state.failDecrypt(
             .chunk_too_large,

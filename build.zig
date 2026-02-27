@@ -56,6 +56,8 @@ pub fn build(b: *std.Build) void {
     // ── Main executable ──
     const strip = b.option(bool, "strip", "Strip debug info from binary") orelse false;
     const profile = b.option(bool, "profile", "Keep frame pointers for perf profiling") orelse false;
+    const dwarf32 = b.option(bool, "dwarf32", "Emit DWARF32 for debugger/profiler compatibility") orelse false;
+    const force_llvm = b.option(bool, "force_llvm", "Force LLVM backend for debug-info stability") orelse false;
     const exe = b.addExecutable(.{
         .name = "znode",
         .root_module = b.createModule(.{
@@ -63,10 +65,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = if (strip) true else null,
+            .dwarf_format = if (dwarf32) .@"32" else null,
             .omit_frame_pointer = if (profile) false else null,
             .unwind_tables = if (profile) .@"async" else null,
         }),
     });
+    if (force_llvm) exe.use_llvm = true;
+    exe.compress_debug_sections = .none;
     configureStep(exe, zio_mod, target);
     b.installArtifact(exe);
 
@@ -85,8 +90,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .dwarf_format = if (dwarf32) .@"32" else null,
         }),
     });
+    if (force_llvm) unit_tests.use_llvm = true;
+    unit_tests.compress_debug_sections = .none;
     configureStep(unit_tests, zio_mod, target);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

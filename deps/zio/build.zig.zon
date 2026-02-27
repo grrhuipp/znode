@@ -1,0 +1,13 @@
+.{
+    .name = .zio,
+    .version = "0.8.2",
+    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0xcf1598b354d576c4,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+    },
+    .dependencies = .{},
+}

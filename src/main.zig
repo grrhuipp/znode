@@ -156,6 +156,16 @@ fn appMain() !void {
         }
     };
 
+    // ── Standalone listener TLS contexts (panel listeners are freed via panel_states) ──
+    var standalone_tls_ctxs: [config_mod.max_config_listeners]?*tls_mod.TlsContext = [_]?*tls_mod.TlsContext{null} ** config_mod.max_config_listeners;
+    defer for (&standalone_tls_ctxs) |*sp| {
+        if (sp.*) |ctx| {
+            var c = ctx;
+            c.deinit();
+            allocator.destroy(ctx);
+        }
+    };
+
     // Listener info storage (shared by dispatcher and session handlers)
     // All listeners' config stored in a single canonical array (replaces per-worker copies)
     const listener_infos = try allocator.create([config_mod.max_listeners]Worker.ListenerInfo);
@@ -327,6 +337,7 @@ fn appMain() !void {
                     if (lc.key_file_len > 0) lc.getKeyFileZ() else null,
                     prefix,
                 );
+                standalone_tls_ctxs[lid] = info.tls_ctx;
             }
             // Shadowsocks inbound for standalone listener
             if (lc.protocol == .shadowsocks and lc.ss_password_len > 0 and lc.ss_method_len > 0) {
@@ -413,7 +424,7 @@ fn appMain() !void {
             config.ip_error_ban_window_sec,
             config.ip_error_ban_duration_sec,
         ),
-        .buf_pool = session_handler.BufPool.init(allocator),
+        .buf_pool = try session_handler.BufPool.init(allocator),
     };
     if (shared.ip_error_ban.enabled()) {
         log.info("ip_error_ban enabled: {d} errors/{d}s -> ban {d}s", .{
@@ -424,9 +435,9 @@ fn appMain() !void {
     } else {
         log.info("ip_error_ban disabled", .{});
     }
-    // Drain cached session buffers before allocator teardown.
+    // Release shared resources before allocator teardown.
     // Keep this defer above rt.deinit so runtime shutdown runs first.
-    defer shared.buf_pool.deinit();
+    defer shared.deinit();
     dispatcher.shared = &shared;
 
     // Initialize zio runtime with N executors (= worker_count, replaces xev worker threads)
@@ -435,7 +446,7 @@ fn appMain() !void {
     });
     defer rt.deinit();
 
-    // Run dispatcher (blocks until Ctrl+C via zio.Signal)
+    // Run dispatcher (blocks until SIGINT/SIGTERM via zio.Signal)
     log.info("starting with {d} executor(s)", .{worker_count});
     try dispatcher.run();
 

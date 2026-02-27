@@ -303,7 +303,7 @@ pub const VMessInbound = struct {
 
     /// Streaming VMess parse:
     ///   1. readExact 42B preamble
-    ///   2. scan users → identify cmd_key + header_len  (replay_mutex locked)
+    ///   2. scan users → identify cmd_key + header_len  (hot_cache.mutex locked internally)
     ///   3. readExact header_len+16 bytes
     ///   4. decrypt header + replay check               (replay_mutex locked)
     ///   5. init StreamStates, encode 38B response header
@@ -325,20 +325,17 @@ pub const VMessInbound = struct {
 
         const now = std.time.timestamp();
 
-        // 2. Identify user + decode header length (does NOT check replay)
-        const step1: vmess_protocol.StreamStep1Result = blk: {
-            self.replay_mutex.lock();
-            defer self.replay_mutex.unlock();
-            break :blk vmess_protocol.streamStep1(
-                work_buf[0..42],
-                users,
-                self.hot_cache,
-                self.allocator,
-                now,
-            ) orelse {
-                debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
-                return error.VMessAuthFailed;
-            };
+        // 2. Identify user + decode header length (does NOT check replay).
+        //    hot_cache locking is handled internally by HotCache methods; no external lock needed.
+        const step1: vmess_protocol.StreamStep1Result = vmess_protocol.streamStep1(
+            work_buf[0..42],
+            users,
+            self.hot_cache,
+            self.allocator,
+            now,
+        ) orelse {
+            debugVmessAuthFailure(lg, users, work_buf[0..42], self.hot_cache != null);
+            return error.VMessAuthFailed;
         };
 
         // 3. Read remaining header: EncHeader(header_len) + GCM-tag(16)
@@ -355,6 +352,7 @@ pub const VMessInbound = struct {
                 step1,
                 self.replay_filter,
                 now,
+                self.allocator,
             );
             switch (result) {
                 .success => |r| break :blk r,

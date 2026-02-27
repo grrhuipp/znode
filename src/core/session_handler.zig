@@ -46,9 +46,11 @@ const OutboundHandler = outbound_mod.OutboundHandler;
 
 // VMess replay filter — needed by Shared (cross-session state)
 const vmess_protocol = @import("../protocol/vmess/vmess_protocol.zig");
+const vmess_crypto = @import("../protocol/vmess/vmess_crypto.zig");
 
-// Buffer pool
-const buf_pool_mod = @import("buf_pool.zig");
+// Buffer pool — Xray-style per-phase slab borrowing
+const buf_mod = @import("buf.zig");
+const buf_pool_mod = @import("buf_pool.zig"); // DynPool (used by buf_mod internally)
 
 // UDP relay
 const udp_packet = @import("../udp/udp_packet.zig");
@@ -56,8 +58,8 @@ const UdpSys = @import("../udp/udp_sys.zig").UdpSys;
 
 const ParsedAction = @import("inbound_result.zig").ParsedAction;
 
-/// Pool for per-session buffers — avoids repeated 216KB heap alloc/free.
-pub const BufPool = buf_pool_mod.FixedPool(SessionBufs, 64);
+/// Shared slab pool — sessions borrow 16 KB slabs per phase, return ASAP.
+pub const BufPool = buf_mod.BufPool;
 
 /// Shared resources for all session handlers (thread-safe).
 pub const Shared = struct {
@@ -69,38 +71,21 @@ pub const Shared = struct {
     active_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     total_sessions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     buf_pool: BufPool,
+
+    pub fn deinit(self: *Shared) void {
+        self.replay_filter.deinit(self.allocator);
+        self.buf_pool.deinit();
+    }
 };
 
-/// Buffer size for relay I/O — must exceed max VMess chunk wire size (~18.5KB).
-const buf_size: usize = 20 * 1024;
-/// Max plaintext per encrypt call. Must not exceed SS AEAD max_payload_size (0x3FFF = 16383);
-/// also leaves room for VMess AEAD overhead (tag + padding) within buf_size.
-const max_encrypt_payload: usize = 16383;
+/// TLS/WS transport buffers — heap-allocated per session only when needed.
+/// 20 KB matches TLS max record (16 KB) + header overhead.
+const transport_buf_size: usize = 20 * 1024;
 /// Max bytes to dump as hex when decrypt/incomplete anomalies occur.
 const error_sample_bytes: usize = 24;
-
-/// Heap-allocated per-session buffers.
-const SessionBufs = struct {
-    // Transport layer I/O (TLS/WS internal buffers)
-    in_read: [buf_size]u8 align(8) = undefined, // align(8) ensures FixedPool Node overlay is safe
-    in_write: [buf_size]u8 = undefined,
-    out_read: [buf_size]u8 = undefined,
-    out_write: [buf_size]u8 = undefined,
-
-    // Protocol parsing + outbound handshake
-    proto: [8192]u8 = undefined,
-    payload: [8192]u8 = undefined,
-
-    // Relay uplink (client → target)
-    up_data: [buf_size]u8 = undefined,
-    up_dec: [buf_size]u8 = undefined,
-    up_enc: [buf_size]u8 = undefined,
-
-    // Relay downlink (target → client)
-    dl_data: [buf_size]u8 = undefined,
-    dl_dec: [buf_size]u8 = undefined,
-    dl_enc: [buf_size]u8 = undefined,
-};
+/// Dynamic upper bounds for rare large-frame compatibility paths.
+const max_dynamic_wire_buf: usize = vmess_crypto.max_chunk_size + 18;
+const max_dynamic_plain_buf: usize = vmess_crypto.max_chunk_size;
 
 const hs_timeout: zio.Timeout = .{ .duration = .fromSeconds(30) };
 const relay_timeout: zio.Timeout = .{ .duration = .fromSeconds(300) };
@@ -133,9 +118,10 @@ const SessionLog = struct {
 
 fn shouldCountIpBanError(err: anyerror) bool {
     return switch (err) {
-        // Ban only on authentication failures.
+        // Ban on protocol authentication failures and repeated WS malformed-frame floods.
         error.VMessAuthFailed,
         error.TrojanAuthFailed,
+        error.WsFrameBufferFull,
         => true,
         else => false,
     };
@@ -220,34 +206,57 @@ fn handleSessionInner(
     slog: *SessionLog,
     lg: *Logger,
 ) !void {
-    const bufs = try shared.buf_pool.acquire();
-    defer shared.buf_pool.release(bufs);
+    const pool = &shared.buf_pool;
+    const alloc = shared.allocator;
 
-    // ── 1. Build inbound Transport (TLS handshake inside) ──
+    // ── 1. Inbound transport buffers — heap, only when TLS/WS needed ──
     slog.stage = "inbound_transport";
+    const need_in_tls = info.tls_enabled;
+    const need_in_ws = info.transport == .ws or info.transport == .wss;
+    var in_read_buf: []u8 = &.{};
+    var in_write_buf: []u8 = &.{};
+    if (need_in_tls or need_in_ws) {
+        in_read_buf = try alloc.alloc(u8, transport_buf_size);
+        in_write_buf = try alloc.alloc(u8, transport_buf_size);
+    }
+    defer {
+        if (in_read_buf.len > 0) alloc.free(in_read_buf);
+        if (in_write_buf.len > 0) alloc.free(in_write_buf);
+    }
+
     var in_tls: ?tls_mod.TlsStream = null;
     defer if (in_tls) |*t| t.deinit();
     var in_ws_storage: ws_mod.WsStream = undefined;
     var in_storage: TransportStorage = .{};
 
     const in_t = try buildInboundTransport(
-        stream,
-        info,
-        &in_tls,
-        &in_ws_storage,
-        &in_storage,
-        &bufs.in_read,
-        &bufs.in_write,
-        lg,
+        stream, info, &in_tls, &in_ws_storage, &in_storage,
+        in_read_buf, in_write_buf, lg,
     );
 
-    // ── 2. Build InboundHandler + parse protocol ──
+    // ── 2. Parse protocol — borrow three slabs from pool ──
+    // work_slab: parse work_buf → outbound handshake send_buf → relay uplink accum
+    // plain_slab: parse plain_buf (returned after parse)
+    // payload_slab: payload extraction → outbound handshake recv_buf (returned after hs)
     slog.stage = "protocol_parse";
+    const work_slab = try pool.acquire();
+    defer pool.release(work_slab);
+
+    var plain_slab: ?*buf_mod.Buf = try pool.acquire();
+    defer if (plain_slab) |s| pool.release(s);
+
+    var payload_slab: ?*buf_mod.Buf = try pool.acquire();
+    defer if (payload_slab) |s| pool.release(s);
+
     var in_handler_storage: inbound_mod.InboundHandlerStorage = .{};
     const inbound = buildInboundHandler(info, shared, &in_handler_storage);
 
     lg.debug("parsing protocol ({s})", .{@tagName(info.protocol)});
-    const parsed = try parseProtocol(in_t, inbound, bufs, lg);
+    const parsed = try parseProtocol(
+        in_t, inbound,
+        &work_slab.data, &plain_slab.?.data, &payload_slab.?.data,
+        lg,
+    );
     var action = parsed.action;
     slog.setTarget(&action.target);
     lg.debug("parsed: udp={} target={s} payload={d}B", .{
@@ -269,7 +278,12 @@ fn handleSessionInner(
     const in_codecs = inbound.codecs(&action.protocol_state);
     var initial_payload: ?[]const u8 = null;
     if (action.payload_len > 0) {
-        initial_payload = try decryptInitialPayload(&action, in_codecs.decoder, bufs, lg);
+        // plain_slab reused as decode scratch here
+        initial_payload = try decryptInitialPayload(
+            &action, in_codecs.decoder,
+            &payload_slab.?.data, &plain_slab.?.data,
+            lg,
+        );
     }
 
     // ── 4. UDP relay (if client requested UDP associate) ──
@@ -323,8 +337,21 @@ fn handleSessionInner(
     defer target_stream.close();
     lg.debug("target connected", .{});
 
-    // ── 7. Build outbound Transport (TLS + WS handshake inside) ──
+    // ── 7. Outbound transport buffers — heap, only when TLS/WS needed ──
     slog.stage = "outbound_transport";
+    const need_out_tls = if (out_config) |oc| ((oc.transport == .tls or oc.transport == .wss) or oc.tls) else false;
+    const need_out_ws = if (out_config) |oc| (oc.transport == .ws or oc.transport == .wss) else false;
+    var out_read_buf: []u8 = &.{};
+    var out_write_buf: []u8 = &.{};
+    if (need_out_tls or need_out_ws) {
+        out_read_buf = try alloc.alloc(u8, transport_buf_size);
+        out_write_buf = try alloc.alloc(u8, transport_buf_size);
+    }
+    defer {
+        if (out_read_buf.len > 0) alloc.free(out_read_buf);
+        if (out_write_buf.len > 0) alloc.free(out_write_buf);
+    }
+
     var out_tls: ?tls_mod.TlsStream = null;
     defer if (out_tls) |*t| t.deinit();
     var out_tls_ctx: ?tls_mod.TlsContext = null;
@@ -333,18 +360,12 @@ fn handleSessionInner(
     var out_storage: TransportStorage = .{};
 
     const out_t = try buildOutboundTransport(
-        target_stream,
-        out_config,
-        &out_tls,
-        &out_tls_ctx,
-        &out_ws_storage,
-        &out_storage,
-        &bufs.out_read,
-        &bufs.out_write,
-        lg,
+        target_stream, out_config,
+        &out_tls, &out_tls_ctx, &out_ws_storage, &out_storage,
+        out_read_buf, out_write_buf, lg,
     );
 
-    // ── 8. Outbound protocol handshake ──
+    // ── 8. Outbound protocol handshake — reuse work_slab as send_buf ──
     slog.stage = "outbound_handshake";
     var out_handler_storage: outbound_mod.OutboundHandlerStorage = .{};
     const outbound = buildOutboundHandler(out_config, &out_handler_storage);
@@ -354,12 +375,18 @@ fn handleSessionInner(
         out_t,
         &action.target,
         initial_payload,
-        &bufs.up_data, // 20KB: proto (8192) too small for header + full initial_payload
-        &bufs.payload,
+        &work_slab.data,       // 16 KB: header + initial_payload
+        &payload_slab.?.data,  // 16 KB: recv buffer
         hs_timeout,
     );
     const out_codecs = outbound.codecs();
     lg.debug("outbound handshake done", .{});
+
+    // plain_slab and payload_slab no longer needed — return to pool now
+    pool.release(plain_slab.?);
+    plain_slab = null;
+    pool.release(payload_slab.?);
+    payload_slab = null;
 
     // ── 9. Send inbound response (VMess header / SS salt) ──
     if (inbound.response(&action)) |resp| {
@@ -367,10 +394,13 @@ fn handleSessionInner(
         try in_t.write(resp, write_timeout);
     }
 
-    // ── 10. Bidirectional relay ──
+    // ── 10. Relay — borrow downlink accum slab, uplink reuses work_slab ──
     slog.stage = "relay";
+    const dl_slab = try pool.acquire();
+    defer pool.release(dl_slab);
+
     lg.debug("entering RELAY", .{});
-    try relayBidirectional(in_t, out_t, in_codecs, out_codecs, bufs, lg);
+    try relayBidirectional(in_t, out_t, in_codecs, out_codecs, pool, work_slab, dl_slab, alloc, lg);
     lg.debug("relay finished normally", .{});
 }
 
@@ -647,20 +677,13 @@ fn buildOutboundHandler(
 fn parseProtocol(
     t: Transport,
     inbound: InboundHandler,
-    bufs: *SessionBufs,
+    work_buf: []u8,
+    plain_buf: []u8,
+    payload_buf: []u8,
     lg: *Logger,
 ) !ParsedAction {
     lg.debug("proto: streaming parse", .{});
-    // Each protocol implementation reads exactly the bytes it needs.
-    // work_buf = up_data (20KB), plain_buf = up_dec (20KB), payload_buf = payload (8KB)
-    const parsed = try inbound.parseStreaming(
-        t,
-        &bufs.up_data,
-        &bufs.up_dec,
-        &bufs.payload,
-        hs_timeout,
-        lg,
-    );
+    const parsed = try inbound.parseStreaming(t, work_buf, plain_buf, payload_buf, hs_timeout, lg);
     lg.debug("proto: parsed udp={} payload={d}B decrypted={}", .{
         parsed.is_udp, parsed.action.payload_len, parsed.action.payload_is_decrypted,
     });
@@ -674,12 +697,13 @@ fn parseProtocol(
 fn decryptInitialPayload(
     action: *ConnectAction,
     decoder: Codec,
-    bufs: *SessionBufs,
+    payload_buf: []u8, // contains raw payload [0..payload_len]; receives decrypted result
+    scratch_buf: []u8, // decode workspace (plain_slab reused)
     lg: *Logger,
 ) !?[]const u8 {
     if (action.payload_len == 0) return null;
 
-    const raw = bufs.payload[0..action.payload_len];
+    const raw = payload_buf[0..action.payload_len];
 
     // SS streaming: first frame already decrypted by parseStreaming
     if (action.payload_is_decrypted) {
@@ -692,11 +716,11 @@ fn decryptInitialPayload(
     }
 
     // VMess: payload_len == 0 (relay handles all chunks), so we never reach here.
-    // Generic fallback: decrypt codec chunks from raw into up_enc.
+    // Generic fallback: decrypt codec chunks from raw into scratch_buf.
     var dec_total: usize = 0;
     var consumed: usize = 0;
     while (consumed < raw.len) {
-        const result = decoder.decrypt(raw[consumed..], bufs.up_enc[dec_total..]);
+        const result = decoder.decrypt(raw[consumed..], scratch_buf[dec_total..]);
         switch (result) {
             .success => |s| {
                 dec_total += s.plaintext_len;
@@ -708,9 +732,9 @@ fn decryptInitialPayload(
     }
 
     if (dec_total > 0) {
-        @memcpy(bufs.payload[0..dec_total], bufs.up_enc[0..dec_total]);
+        @memcpy(payload_buf[0..dec_total], scratch_buf[0..dec_total]);
         lg.debug("payload decrypted: {d}B -> {d}B", .{ raw.len, dec_total });
-        return bufs.payload[0..dec_total];
+        return payload_buf[0..dec_total];
     }
 
     return null;
@@ -725,13 +749,17 @@ fn relayBidirectional(
     out_t: Transport,
     in_codecs: CodecPair,
     out_codecs: CodecPair,
-    bufs: *SessionBufs,
+    pool: *buf_mod.BufPool,
+    up_slab: *buf_mod.Buf, // pre-borrowed uplink read-accum (reused work_slab)
+    dl_slab: *buf_mod.Buf, // pre-borrowed downlink read-accum
+    alloc: std.mem.Allocator,
     lg: *Logger,
 ) !void {
     lg.debug("relay: spawning uplink+downlink coroutines", .{});
 
     var done: zio.Notify = .init;
     var group: zio.Group = .init;
+    var first_err: ?anyerror = null;
     defer {
         lg.debug("relay: canceling group", .{});
         group.cancel();
@@ -739,83 +767,145 @@ fn relayBidirectional(
     }
 
     try group.spawn(relayUplinkWrapper, .{
-        &done, in_t, out_t,
-        in_codecs.decoder, out_codecs.encoder,
-        &bufs.up_data, &bufs.up_dec, &bufs.up_enc, lg,
+        &first_err, &done,
+        in_t, out_t, in_codecs.decoder, out_codecs.encoder,
+        pool, up_slab, alloc, lg,
     });
     try group.spawn(relayDownlinkWrapper, .{
-        &done, out_t, in_t,
-        out_codecs.decoder, in_codecs.encoder,
-        &bufs.dl_data, &bufs.dl_dec, &bufs.dl_enc, lg,
+        &first_err, &done,
+        out_t, in_t, out_codecs.decoder, in_codecs.encoder,
+        pool, dl_slab, alloc, lg,
     });
 
     lg.debug("relay: waiting for first direction to finish...", .{});
     done.wait() catch {};
     lg.debug("relay: done.wait() returned", .{});
+
+    if (first_err) |err| return err;
 }
 
 fn relayUplinkWrapper(
+    first_err: *?anyerror,
     done: *zio.Notify,
     read_t: Transport,
     write_t: Transport,
     decoder: Codec,
     encoder: Codec,
-    read_buf: *[buf_size]u8,
-    dec_buf: *[buf_size]u8,
-    enc_buf: *[buf_size]u8,
+    pool: *buf_mod.BufPool,
+    read_slab: *buf_mod.Buf,
+    alloc: std.mem.Allocator,
     lg: *Logger,
 ) void {
     defer {
         lg.debug("UPLINK done, signaling", .{});
         done.signal();
     }
-    relayDirection(read_t, write_t, decoder, encoder, read_buf, dec_buf, enc_buf, lg, "UL") catch |err| {
-        if (err != error.Canceled)
+    relayDirection(read_t, write_t, decoder, encoder, pool, read_slab, alloc, lg, "UL") catch |err| {
+        if (err != error.Canceled) {
             lg.debug("UPLINK error: {s}", .{@errorName(err)});
+            if (first_err.* == null) first_err.* = err;
+        }
     };
 }
 
 fn relayDownlinkWrapper(
+    first_err: *?anyerror,
     done: *zio.Notify,
     read_t: Transport,
     write_t: Transport,
     decoder: Codec,
     encoder: Codec,
-    read_buf: *[buf_size]u8,
-    dec_buf: *[buf_size]u8,
-    enc_buf: *[buf_size]u8,
+    pool: *buf_mod.BufPool,
+    read_slab: *buf_mod.Buf,
+    alloc: std.mem.Allocator,
     lg: *Logger,
 ) void {
     defer {
         lg.debug("DOWNLINK done, signaling", .{});
         done.signal();
     }
-    relayDirection(read_t, write_t, decoder, encoder, read_buf, dec_buf, enc_buf, lg, "DL") catch |err| {
-        if (err != error.Canceled)
+    relayDirection(read_t, write_t, decoder, encoder, pool, read_slab, alloc, lg, "DL") catch |err| {
+        if (err != error.Canceled) {
             lg.debug("DOWNLINK error: {s}", .{@errorName(err)});
+            if (first_err.* == null) first_err.* = err;
+        }
     };
 }
 
 /// Generic relay direction: read → decrypt → encrypt → write.
 /// Handles frame accumulation for codecs that return .incomplete.
+fn ensureRelayBufferCapacity(
+    current: []u8,
+    heap_storage: *?[]u8,
+    used: usize,
+    required: usize,
+    max_capacity: usize,
+) ![]u8 {
+    if (required <= current.len) return current;
+    if (required > max_capacity) return error.RelayBufferLimitExceeded;
+
+    var new_cap = current.len;
+    while (new_cap < required) {
+        const doubled = std.math.mul(usize, new_cap, 2) catch max_capacity;
+        const next = if (doubled > max_capacity) max_capacity else doubled;
+        if (next == new_cap) break;
+        new_cap = next;
+    }
+    if (new_cap < required) return error.RelayBufferLimitExceeded;
+
+    const new_buf = try std.heap.page_allocator.alloc(u8, new_cap);
+    if (used > 0) {
+        @memcpy(new_buf[0..used], current[0..used]);
+    }
+    if (heap_storage.*) |old| {
+        std.heap.page_allocator.free(old);
+    }
+    heap_storage.* = new_buf;
+    return new_buf;
+}
+
 fn relayDirection(
     read_t: Transport,
     write_t: Transport,
     decoder: Codec,
     encoder: Codec,
-    read_buf: *[buf_size]u8,
-    dec_buf: *[buf_size]u8,
-    enc_buf: *[buf_size]u8,
+    pool: *buf_mod.BufPool,
+    read_slab: *buf_mod.Buf, // pre-borrowed read-accum slab (held for relay duration)
+    alloc: std.mem.Allocator,
     lg: *Logger,
     comptime tag: []const u8,
 ) !void {
+    // Read-accum: start from the pre-borrowed slab, may grow to heap for large frames.
+    var active_read: []u8 = &read_slab.data;
+    var heap_read: ?[]u8 = null;
+    defer if (heap_read) |buf| std.heap.page_allocator.free(buf);
+
+    // Dec buffer: borrow a slab; grows to heap if VMess reports output_buffer_too_small.
+    // The dec slab (or heap) is held for the relay direction lifetime so the grow-and-retry
+    // path across frames works without re-borrowing.
+    const dec_slab = if (!decoder.is_noop) try pool.acquire() else null;
+    defer if (dec_slab) |s| pool.release(s);
+    var active_dec: []u8 = if (dec_slab) |s| &s.data else &.{};
+    var heap_dec: ?[]u8 = null;
+    defer if (heap_dec) |buf| alloc.free(buf);
+
     var chunks: u64 = 0;
     var total_bytes: u64 = 0;
     var accum: usize = 0;
     lg.debug(tag ++ ": starting loop", .{});
 
     while (true) {
-        const n = try read_t.read(read_buf[accum..], relay_timeout);
+        if (accum == active_read.len) {
+            active_read = try ensureRelayBufferCapacity(
+                active_read,
+                &heap_read,
+                accum,
+                accum + 1,
+                max_dynamic_wire_buf,
+            );
+        }
+
+        const n = try read_t.read(active_read[accum..], relay_timeout);
         if (n == 0) {
             lg.debug(tag ++ ": EOF after {d} chunks, {d}B total", .{ chunks, total_bytes });
             return;
@@ -824,7 +914,7 @@ fn relayDirection(
 
         if (decoder.is_noop and encoder.is_noop) {
             // Zero-copy passthrough (e.g. Trojan → Direct)
-            try write_t.write(read_buf[0..accum], write_timeout);
+            try write_t.write(active_read[0..accum], write_timeout);
             chunks += 1;
             total_bytes += accum;
             accum = 0;
@@ -834,20 +924,20 @@ fn relayDirection(
             while (consumed < accum) {
                 if (decoder.is_noop) {
                     // No decrypt — plaintext is raw data, just encrypt + send
-                    try encryptAndSend(write_t, encoder, read_buf[consumed..accum], enc_buf);
+                    try encryptAndSendPool(pool, write_t, encoder, active_read[consumed..accum]);
                     total_bytes += accum - consumed;
                     chunks += 1;
                     consumed = accum;
                 } else {
                     // Decrypt one frame
-                    const result = decoder.decrypt(read_buf[consumed..accum], dec_buf);
+                    const result = decoder.decrypt(active_read[consumed..accum], active_dec);
                     switch (result) {
                         .success => |s| {
                             if (s.plaintext_len > 0) {
                                 if (encoder.is_noop) {
-                                    try write_t.write(dec_buf[0..s.plaintext_len], write_timeout);
+                                    try write_t.write(active_dec[0..s.plaintext_len], write_timeout);
                                 } else {
-                                    try encryptAndSend(write_t, encoder, dec_buf[0..s.plaintext_len], enc_buf);
+                                    try encryptAndSendPool(pool, write_t, encoder, active_dec[0..s.plaintext_len]);
                                 }
                                 total_bytes += s.plaintext_len;
                             }
@@ -855,23 +945,61 @@ fn relayDirection(
                             chunks += 1;
                         },
                         .incomplete => {
-                            if (consumed == 0 and accum == read_buf.len) {
+                            if (consumed == 0 and accum == buf_mod.slab_size) {
+                                const old_cap = active_read.len;
+                                active_read = try ensureRelayBufferCapacity(
+                                    active_read,
+                                    &heap_read,
+                                    accum,
+                                    old_cap + 1,
+                                    max_dynamic_wire_buf,
+                                );
+                                if (active_read.len == old_cap) {
+                                    const sample_len = @min(error_sample_bytes, accum);
+                                    lg.warn(tag ++ ": decoder incomplete with full buffer read={d}B accum={d} dec_noop={} enc_noop={} sample={x}", .{
+                                        n,
+                                        accum,
+                                        decoder.is_noop,
+                                        encoder.is_noop,
+                                        active_read[0..sample_len],
+                                    });
+                                }
+                            } else if (consumed == 0 and accum == active_read.len) {
                                 const sample_len = @min(error_sample_bytes, accum);
                                 lg.warn(tag ++ ": decoder incomplete with full buffer read={d}B accum={d} dec_noop={} enc_noop={} sample={x}", .{
                                     n,
                                     accum,
                                     decoder.is_noop,
                                     encoder.is_noop,
-                                    read_buf[0..sample_len],
+                                    active_read[0..sample_len],
                                 });
                             }
                             break;
                         },
                         .integrity_error => {
+                            var retried_with_bigger_dec_buf = false;
                             const pending = accum - consumed;
                             const sample_len = @min(error_sample_bytes, pending);
                             if (decoder.decryptDebug()) |dbg| switch (dbg) {
                                 .vmess => |v| {
+                                    if (v.kind == .output_buffer_too_small) {
+                                        const needed_plain: usize = if (v.enc_len >= v.tag_len)
+                                            v.enc_len - v.tag_len
+                                        else
+                                            0;
+                                        if (needed_plain > active_dec.len) {
+                                            active_dec = try ensureRelayBufferCapacity(
+                                                active_dec,
+                                                &heap_dec,
+                                                0,
+                                                needed_plain,
+                                                max_dynamic_plain_buf,
+                                            );
+                                            retried_with_bigger_dec_buf = true;
+                                        }
+                                    }
+                                    if (retried_with_bigger_dec_buf) continue;
+
                                     if (sample_len > 0) {
                                         lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending={d} proto=vmess reason={s} sec={s} nonce={d} size_nonce={d} auth_len={} mask={} padding={} data_len={d} size_field={d} total_payload={d} padding_len={d} enc_len={d} tag_len={d} wire_len={d} sample={x}", .{
                                             chunks + 1,
@@ -894,7 +1022,7 @@ fn relayDirection(
                                             v.enc_len,
                                             v.tag_len,
                                             v.wire_len,
-                                            read_buf[consumed .. consumed + sample_len],
+                                            active_read[consumed .. consumed + sample_len],
                                         });
                                     } else {
                                         lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending=0 proto=vmess reason={s} sec={s} nonce={d} size_nonce={d} auth_len={} mask={} padding={} data_len={d} size_field={d} total_payload={d} padding_len={d} enc_len={d} tag_len={d} wire_len={d}", .{
@@ -930,7 +1058,7 @@ fn relayDirection(
                                     pending,
                                     decoder.is_noop,
                                     encoder.is_noop,
-                                    read_buf[consumed .. consumed + sample_len],
+                                    active_read[consumed .. consumed + sample_len],
                                 });
                             } else {
                                 lg.warn(tag ++ ": decrypt integrity_error chunk={d} total={d}B read={d}B accum={d} consumed={d} pending=0 dec_noop={} enc_noop={}", .{
@@ -952,7 +1080,7 @@ fn relayDirection(
             // Shift unconsumed data to buffer start
             if (consumed > 0) {
                 const remaining = accum - consumed;
-                if (remaining > 0) std.mem.copyForwards(u8, read_buf[0..remaining], read_buf[consumed..accum]);
+                if (remaining > 0) std.mem.copyForwards(u8, active_read[0..remaining], active_read[consumed..accum]);
                 accum = remaining;
             }
         }
@@ -966,12 +1094,15 @@ fn relayDirection(
 }
 
 /// Encrypt plaintext in safe-sized chunks and send via transport.
-fn encryptAndSend(t: Transport, encoder: Codec, plaintext: []const u8, enc_buf: []u8) !void {
+/// Borrows an enc slab from the pool per chunk, writes, then returns it immediately.
+fn encryptAndSendPool(pool: *buf_mod.BufPool, t: Transport, encoder: Codec, plaintext: []const u8) !void {
     var offset: usize = 0;
     while (offset < plaintext.len) {
-        const end = @min(offset + max_encrypt_payload, plaintext.len);
-        const n = encoder.encrypt(plaintext[offset..end], enc_buf) orelse return error.EncryptFailed;
-        try t.write(enc_buf[0..n], write_timeout);
+        const end = @min(offset + buf_mod.max_enc_per_slab, plaintext.len);
+        const enc_slab = try pool.acquire();
+        defer pool.release(enc_slab);
+        const n = encoder.encrypt(plaintext[offset..end], &enc_slab.data) orelse return error.EncryptFailed;
+        try t.write(enc_slab.data[0..n], write_timeout);
         offset = end;
     }
 }

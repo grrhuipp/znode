@@ -94,48 +94,43 @@ pub const response_wire_size: usize = 38;
 // ── Replay Filter ──
 
 pub const ReplayFilter = struct {
-    entries: [MAX_ENTRIES]Entry = undefined,
-    count: u16 = 0,
-    head: u16 = 0,
+    entries: std.AutoHashMapUnmanaged(vmess_crypto.AuthID, i64) = .{},
+    last_cleanup: i64 = 0,
 
-    const MAX_ENTRIES = 4096;
+    const cleanup_interval: i64 = 30;
 
-    const Entry = struct {
-        auth_id: vmess_crypto.AuthID,
-        timestamp: i64,
-    };
+    pub fn deinit(self: *ReplayFilter, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+    }
 
     /// Check if AuthID is a replay. If not, record it.
     /// Returns true if duplicate detected.
-    pub fn isDuplicate(self: *ReplayFilter, auth_id: vmess_crypto.AuthID, now: i64) bool {
-        self.evictExpired(now);
-
-        // Check existing entries
-        const check_count = @min(self.count, MAX_ENTRIES);
-        for (0..check_count) |i| {
-            const idx = (self.head + MAX_ENTRIES - 1 - @as(u16, @intCast(i))) % MAX_ENTRIES;
-            if (constantTimeEql(vmess_crypto.AuthID, self.entries[idx].auth_id, auth_id)) {
-                return true;
-            }
+    /// On OOM, conservatively returns true (rejects the connection).
+    /// Caller must hold replay_mutex.
+    pub fn isDuplicate(self: *ReplayFilter, auth_id: vmess_crypto.AuthID, now: i64, allocator: std.mem.Allocator) bool {
+        if (now - self.last_cleanup >= cleanup_interval) {
+            self.evictExpired(allocator, now);
+            self.last_cleanup = now;
         }
 
-        // Record new entry
-        self.entries[self.head] = .{ .auth_id = auth_id, .timestamp = now };
-        self.head = (self.head + 1) % MAX_ENTRIES;
-        if (self.count < MAX_ENTRIES) self.count += 1;
-
+        const gop = self.entries.getOrPut(allocator, auth_id) catch return true;
+        if (gop.found_existing) return true;
+        gop.value_ptr.* = now;
         return false;
     }
 
-    fn evictExpired(self: *ReplayFilter, now: i64) void {
-        while (self.count > 0) {
-            const tail = (self.head + MAX_ENTRIES - self.count) % MAX_ENTRIES;
-            const age = now - self.entries[tail].timestamp;
-            if (age > vmess_crypto.auth_id_window) {
-                self.count -= 1;
-            } else {
-                break;
+    fn evictExpired(self: *ReplayFilter, allocator: std.mem.Allocator, now: i64) void {
+        var victims: std.ArrayListUnmanaged(vmess_crypto.AuthID) = .{};
+        defer victims.deinit(allocator);
+
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.* > vmess_crypto.auth_id_window) {
+                victims.append(allocator, entry.key_ptr.*) catch continue;
             }
+        }
+        for (victims.items) |key| {
+            _ = self.entries.remove(key);
         }
     }
 };
@@ -168,13 +163,13 @@ pub fn parseRequest(
             // Verify user still exists in current UserMap
             if (user_map.findById(hit.user_id)) |user| {
                 if (user.enabled) {
-                    if (tryDecryptHeader(data, hit.cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user)) |result| {
+                    if (tryDecryptHeader(data, hit.cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user, allocator)) |result| {
                         return result;
                     }
                 }
             }
             // User removed or decrypt failed → evict from cache
-            cache.evictUser(hit.user_id);
+            cache.evictUser(hit.user_id, allocator);
         }
     }
 
@@ -190,10 +185,10 @@ pub fn parseRequest(
         const ts = vmess_crypto.validateAuthId(auth_id, auth_key, now) orelse continue;
         _ = ts;
 
-        if (tryDecryptHeader(data, cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user)) |result| {
+        if (tryDecryptHeader(data, cmd_key, auth_id, enc_length_block, connection_nonce, replay_filter, now, user, allocator)) |result| {
             // Record in hot cache on successful auth from slow path
             if (hot_cache) |cache| {
-                cache.recordAuth(user.id, cmd_key, auth_key, now, allocator);
+                cache.recordAuth(user.id, cmd_key, auth_key, now, allocator, @max(1, user_map.users.len / 10));
             }
             return result;
         }
@@ -213,6 +208,7 @@ fn tryDecryptHeader(
     replay_filter: *ReplayFilter,
     now: i64,
     user: *const user_store.UserStore.UserInfo,
+    allocator: std.mem.Allocator,
 ) ?ParseResult {
     const length_key = vmess_crypto.deriveHeaderLengthKey(cmd_key, auth_id, connection_nonce);
     const length_nonce = vmess_crypto.deriveHeaderLengthNonce(cmd_key, auth_id, connection_nonce);
@@ -249,7 +245,7 @@ fn tryDecryptHeader(
         header_key,
     ) catch return .protocol_error;
 
-    if (replay_filter.isDuplicate(auth_id, now)) return .replay_detected;
+    if (replay_filter.isDuplicate(auth_id, now, allocator)) return .replay_detected;
 
     return parseDecryptedHeader(header_plain[0..header_len], total_len, cmd_key, connection_nonce, user);
 }
@@ -261,6 +257,7 @@ pub fn parseRequestWithKey(
     user: ?*const user_store.UserStore.UserInfo,
     replay_filter: *ReplayFilter,
     timestamp: i64,
+    allocator: std.mem.Allocator,
 ) ParseResult {
     if (data.len < 42) return .incomplete;
 
@@ -311,7 +308,7 @@ pub fn parseRequestWithKey(
         header_key,
     ) catch return .protocol_error;
 
-    if (replay_filter.isDuplicate(auth_id, timestamp)) return .replay_detected;
+    if (replay_filter.isDuplicate(auth_id, timestamp, allocator)) return .replay_detected;
 
     return parseDecryptedHeader(header_plain[0..header_len], total_len, cmd_key, connection_nonce, user);
 }
@@ -747,7 +744,8 @@ pub const StreamStep1Result = struct {
 
 /// Streaming step 1: scan users + decode header length from the 42-byte preamble.
 /// Returns null if no user matches (auth failed).
-/// Call with replay_mutex held if hot_cache is shared.
+/// HotCache locking is handled internally by HotCache.tryAuth / recordAuth / evictUser;
+/// callers do NOT need to hold any external lock for this function.
 pub fn streamStep1(
     preamble: *const [42]u8,
     user_map: *const user_store.UserStore.UserMap,
@@ -769,7 +767,7 @@ pub fn streamStep1(
                     }
                 }
             }
-            cache.evictUser(hit.user_id);
+            cache.evictUser(hit.user_id, allocator);
         }
     }
 
@@ -780,7 +778,7 @@ pub fn streamStep1(
         _ = vmess_crypto.validateAuthId(auth_id, auth_key, now) orelse continue;
         const cmd_key = user.cached_cmd_key;
         if (tryPeekHeaderLen(enc_length_block, cmd_key, auth_id, connection_nonce)) |header_len| {
-            if (hot_cache) |cache| cache.recordAuth(user.id, cmd_key, auth_key, now, allocator);
+            if (hot_cache) |cache| cache.recordAuth(user.id, cmd_key, auth_key, now, allocator, @max(1, user_map.users.len / 10));
             return .{ .header_len = header_len, .cmd_key = cmd_key, .auth_id = auth_id, .connection_nonce = connection_nonce, .user = user };
         }
     }
@@ -820,6 +818,7 @@ pub fn streamStep2(
     step1: StreamStep1Result,
     replay_filter: *ReplayFilter,
     now: i64,
+    allocator: std.mem.Allocator,
 ) ParseResult {
     const total_len: usize = 42 + @as(usize, step1.header_len) + 16;
     if (full_data.len < total_len) return .incomplete;
@@ -842,7 +841,7 @@ pub fn streamStep2(
         header_key,
     ) catch return .protocol_error;
 
-    if (replay_filter.isDuplicate(step1.auth_id, now)) return .replay_detected;
+    if (replay_filter.isDuplicate(step1.auth_id, now, allocator)) return .replay_detected;
 
     return parseDecryptedHeader(
         header_plain[0..step1.header_len],
@@ -893,7 +892,8 @@ test "encodeRequest and parseRequest roundtrip IPv4" {
     ) orelse return error.EncodeFailed;
 
     var replay = ReplayFilter{};
-    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp);
+    defer replay.deinit(std.testing.allocator);
+    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp, std.testing.allocator);
 
     switch (result) {
         .success => |req| {
@@ -932,7 +932,8 @@ test "encodeRequest and parseRequest roundtrip domain" {
     ) orelse return error.EncodeFailed;
 
     var replay = ReplayFilter{};
-    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp);
+    defer replay.deinit(std.testing.allocator);
+    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp, std.testing.allocator);
 
     switch (result) {
         .success => |req| {
@@ -956,7 +957,8 @@ test "encodeRequest and parseRequest roundtrip IPv6" {
     const n = encodeRequestWithParams(&buf, uuid, &target, .tcp, .none, .{}, timestamp, 0, [_]u8{0x55} ** 16, [_]u8{0x66} ** 16, null) orelse return error.EncodeFailed;
 
     var replay = ReplayFilter{};
-    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp);
+    defer replay.deinit(std.testing.allocator);
+    const result = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp, std.testing.allocator);
 
     switch (result) {
         .success => |req| {
@@ -970,7 +972,8 @@ test "encodeRequest and parseRequest roundtrip IPv6" {
 test "parseRequest incomplete data" {
     const cmd_key = [_]u8{0x01} ** 16;
     var replay = ReplayFilter{};
-    const result = parseRequestWithKey(&[_]u8{0} ** 20, cmd_key, null, &replay, 0);
+    defer replay.deinit(std.testing.allocator);
+    const result = parseRequestWithKey(&[_]u8{0} ** 20, cmd_key, null, &replay, 0, std.testing.allocator);
     try testing.expect(result == .incomplete);
 }
 
@@ -984,7 +987,8 @@ test "parseRequest wrong key" {
     const n = encodeRequestWithParams(&buf, uuid, &target, .tcp, .aes_128_gcm, .{}, timestamp, 0, [_]u8{0} ** 16, [_]u8{0} ** 16, null) orelse return error.EncodeFailed;
 
     var replay = ReplayFilter{};
-    const result = parseRequestWithKey(buf[0..n], wrong_key, null, &replay, timestamp);
+    defer replay.deinit(std.testing.allocator);
+    const result = parseRequestWithKey(buf[0..n], wrong_key, null, &replay, timestamp, std.testing.allocator);
     try testing.expect(result == .auth_failed);
 }
 
@@ -998,13 +1002,14 @@ test "parseRequest replay detection" {
     const n = encodeRequestWithParams(&buf, uuid, &target, .tcp, .aes_128_gcm, .{}, timestamp, 0x42, [_]u8{0} ** 16, [_]u8{0} ** 16, null) orelse return error.EncodeFailed;
 
     var replay = ReplayFilter{};
+    defer replay.deinit(std.testing.allocator);
 
     // First parse should succeed
-    const r1 = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp);
+    const r1 = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp, std.testing.allocator);
     try testing.expect(r1 == .success);
 
     // Second parse with same data should detect replay
-    const r2 = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp);
+    const r2 = parseRequestWithKey(buf[0..n], cmd_key, null, &replay, timestamp, std.testing.allocator);
     try testing.expect(r2 == .replay_detected);
 }
 
@@ -1132,22 +1137,24 @@ test "SecurityMethod enum values" {
 
 test "ReplayFilter deduplication" {
     var filter = ReplayFilter{};
+    defer filter.deinit(std.testing.allocator);
     const auth_id = [_]u8{0xAA} ** 16;
     const now: i64 = 1700000000;
 
-    try testing.expect(!filter.isDuplicate(auth_id, now)); // First time: not duplicate
-    try testing.expect(filter.isDuplicate(auth_id, now)); // Second time: duplicate
+    try testing.expect(!filter.isDuplicate(auth_id, now, std.testing.allocator)); // First time: not duplicate
+    try testing.expect(filter.isDuplicate(auth_id, now, std.testing.allocator)); // Second time: duplicate
 }
 
 test "ReplayFilter expiration" {
     var filter = ReplayFilter{};
+    defer filter.deinit(std.testing.allocator);
     const auth_id = [_]u8{0xBB} ** 16;
     const now: i64 = 1700000000;
 
-    try testing.expect(!filter.isDuplicate(auth_id, now));
+    try testing.expect(!filter.isDuplicate(auth_id, now, std.testing.allocator));
 
     // After expiration window, should not be detected as duplicate
-    try testing.expect(!filter.isDuplicate(auth_id, now + vmess_crypto.auth_id_window + 1));
+    try testing.expect(!filter.isDuplicate(auth_id, now + vmess_crypto.auth_id_window + 1, std.testing.allocator));
 }
 
 test "encodeRequest buffer too small" {

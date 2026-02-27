@@ -132,7 +132,7 @@ pub const Dispatcher = struct {
     }
 
     /// Run the dispatcher. Must be called from a zio coroutine context.
-    /// Creates servers, spawns accept loops, and blocks until Ctrl+C.
+    /// Creates servers, spawns accept loops, and blocks until shutdown signal.
     pub fn run(self: *Dispatcher) !void {
         self.session_group = zio.Group.init;
 
@@ -152,10 +152,13 @@ pub const Dispatcher = struct {
         // Spawn live listener monitor (checks pending queue every 500ms)
         try accept_group.spawn(liveListenerLoop, .{ self, &accept_group });
 
-        // Wait for shutdown signal (Ctrl+C)
+        // Wait for shutdown signal (SIGINT or SIGTERM)
         var sig_int = try zio.Signal.init(.interrupt);
         defer sig_int.deinit();
-        sig_int.wait() catch {};
+        var sig_term = try zio.Signal.init(.terminate);
+        defer sig_term.deinit();
+
+        _ = zio.select(.{ .sig_int = &sig_int, .sig_term = &sig_term }) catch {};
 
         self.stopping = true;
         // defer block: accept_group.cancel() then session_group.cancel()

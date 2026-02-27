@@ -31,8 +31,9 @@ pub const AuthID = [16]u8;
 /// Auth ID timestamp tolerance in seconds (matches Xray: ±120s).
 pub const auth_id_window: i64 = 120;
 
-/// Maximum chunk size (18KB).
-pub const max_chunk_size: usize = 18 * 1024;
+/// Maximum VMess chunk payload size encoded by the 2-byte length field.
+/// VMess/Xray does not impose a lower fixed cap than the protocol field width.
+pub const max_chunk_size: usize = std.math.maxInt(u16);
 
 /// GCM tag size.
 pub const gcm_tag_size: usize = 16;

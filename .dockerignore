@@ -1,0 +1,8 @@
+.zig-cache/
+.git/
+.claude/
+src/
+build.zig
+build.zig.zon
+deps/
+config/

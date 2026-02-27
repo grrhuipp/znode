@@ -66,9 +66,9 @@ pub const WsStream = struct {
     // - handshake stage: HTTP Upgrade headers
     // - data stage: WS frame accumulation
     //
-    // 4KB is too small for common VMess/Trojan-over-WS frame sizes and can
-    // trigger WsFrameBufferFull under normal client behavior.
-    hs_buf: [32 * 1024]u8 = undefined,
+    // Small streaming input buffer.
+    // Data frames are consumed incrementally so we do not require full-frame buffering.
+    hs_buf: [8 * 1024]u8 = undefined,
     hs_len: usize = 0,
 
     // Output buffer (handshake response / control frames)
@@ -84,6 +84,14 @@ pub const WsStream = struct {
 
     // Whether client handshake request has been generated
     client_request_sent: bool = false,
+
+    // Streaming frame state for data opcodes (binary/text/continuation).
+    frame_active: bool = false,
+    frame_opcode: Opcode = .binary,
+    frame_masked: bool = false,
+    frame_mask_key: [4]u8 = .{ 0, 0, 0, 0 },
+    frame_payload_remaining: usize = 0,
+    frame_mask_offset: u32 = 0,
 
     /// Create a server-side WebSocket stream.
     pub fn initServer(path: []const u8, host: []const u8) WsStream {
@@ -137,30 +145,57 @@ pub const WsStream = struct {
     /// Read decoded application data (unwrap WebSocket frames).
     pub fn readDecrypted(self: *WsStream, buf: []u8) WsResult {
         if (!self.handshake_done) return .want_read;
+        if (buf.len == 0) return .want_read;
 
-        // Loop to skip control frames (ping/pong) without recursion
+        // Loop to skip control frames and initialize data-frame streaming state.
         var control_frames_processed: u8 = 0;
         while (control_frames_processed < 16) {
+            // Stream out payload bytes for an already-open data frame.
+            if (self.frame_active) {
+                const available = self.hs_buf[self.leftover_start..self.hs_len];
+                if (available.len == 0) return .want_read;
+
+                const n_copy = @min(buf.len, @min(available.len, self.frame_payload_remaining));
+                @memcpy(buf[0..n_copy], available[0..n_copy]);
+                if (self.frame_masked) {
+                    applyMaskWithOffset(buf[0..n_copy], self.frame_mask_key, self.frame_mask_offset);
+                }
+                self.consumeInput(n_copy);
+                self.frame_payload_remaining -= n_copy;
+                self.frame_mask_offset +%= @intCast(n_copy);
+                if (self.frame_payload_remaining == 0) {
+                    self.frame_active = false;
+                    self.frame_mask_offset = 0;
+                }
+                return .{ .bytes = n_copy };
+            }
+
             const available = self.hs_buf[self.leftover_start..self.hs_len];
             if (available.len == 0) return .want_read;
 
             const hdr = parseFrameHeader(available) orelse return .want_read;
             const total_frame = hdr.header_size + @as(usize, @intCast(hdr.payload_len));
-            if (available.len < total_frame) return .want_read;
-
             const payload_len: usize = @intCast(hdr.payload_len);
 
             switch (hdr.opcode) {
                 .binary, .text, .continuation => {
-                    if (buf.len < payload_len) return .err;
-                    @memcpy(buf[0..payload_len], available[hdr.header_size .. hdr.header_size + payload_len]);
-                    if (hdr.masked) {
-                        applyMask(buf[0..payload_len], hdr.mask_key);
+                    // Consume header first, then stream payload progressively.
+                    self.consumeInput(hdr.header_size);
+                    self.frame_active = true;
+                    self.frame_opcode = hdr.opcode;
+                    self.frame_masked = hdr.masked;
+                    self.frame_mask_key = hdr.mask_key;
+                    self.frame_payload_remaining = payload_len;
+                    self.frame_mask_offset = 0;
+
+                    if (payload_len == 0) {
+                        self.frame_active = false;
+                        return .{ .bytes = 0 };
                     }
-                    self.consumeInput(total_frame);
-                    return .{ .bytes = payload_len };
+                    continue;
                 },
                 .ping => {
+                    if (available.len < total_frame) return .want_read;
                     var ping_payload_buf: [125]u8 = undefined;
                     const ping_len = @min(payload_len, 125);
                     @memcpy(ping_payload_buf[0..ping_len], available[hdr.header_size .. hdr.header_size + ping_len]);
@@ -179,11 +214,13 @@ pub const WsStream = struct {
                     continue; // loop to next frame
                 },
                 .pong => {
+                    if (available.len < total_frame) return .want_read;
                     self.consumeInput(total_frame);
                     control_frames_processed += 1;
                     continue; // loop to next frame
                 },
                 .close => {
+                    if (available.len < total_frame) return .want_read;
                     const close_size = encodeFrame(
                         self.out_buf[self.out_len..],
                         .close,
@@ -259,6 +296,18 @@ pub const WsStream = struct {
         };
 
         if (!self.handshake_done or available == 0) return state;
+
+        if (self.frame_active) {
+            state.has_frame_header = true;
+            state.frame_fin = true;
+            state.frame_opcode = @intFromEnum(self.frame_opcode);
+            state.frame_masked = self.frame_masked;
+            state.frame_payload_len = self.frame_payload_remaining;
+            state.frame_header_size = 0;
+            state.frame_total_size = self.frame_payload_remaining;
+            state.frame_complete = available >= self.frame_payload_remaining;
+            return state;
+        }
 
         const view = self.hs_buf[self.leftover_start..self.hs_len];
         if (parseFrameHeader(view)) |hdr| {
@@ -401,7 +450,7 @@ pub const WsStream = struct {
     fn consumeInput(self: *WsStream, n: usize) void {
         const remaining = self.hs_len - self.leftover_start - n;
         if (remaining > 0) {
-            std.mem.copyBackwards(
+            std.mem.copyForwards(
                 u8,
                 self.hs_buf[self.leftover_start .. self.leftover_start + remaining],
                 self.hs_buf[self.leftover_start + n .. self.hs_len],
