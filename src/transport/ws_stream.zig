@@ -173,7 +173,14 @@ pub const WsStream = struct {
             const available = self.hs_buf[self.leftover_start..self.hs_len];
             if (available.len == 0) return .want_read;
 
-            const hdr = parseFrameHeader(available) orelse return .want_read;
+            const hdr = parseFrameHeader(available) orelse {
+                // If there are enough bytes for a complete frame header (max 14B:
+                // 2 base + 8 extended-len + 4 mask) but still can't parse, the
+                // opcode is invalid/reserved. Close immediately instead of letting
+                // the buffer fill up and triggering WsFrameBufferFull.
+                if (available.len >= 14) return .err;
+                return .want_read;
+            };
             const total_frame = hdr.header_size + @as(usize, @intCast(hdr.payload_len));
             const payload_len: usize = @intCast(hdr.payload_len);
 
@@ -1018,6 +1025,25 @@ test "applyMaskWithOffset streaming consistency" {
     applyMaskWithOffset(chunked[7..57], mask, 7);
     applyMaskWithOffset(chunked[57..100], mask, 57);
     try testing.expectEqualSlices(u8, &full, &chunked);
+}
+
+test "readDecrypted returns err for invalid opcode with sufficient data" {
+    // Construct a server-side WsStream that has already completed handshake
+    // by directly feeding a post-handshake frame with a reserved opcode (0x03).
+    var ws = WsStream.initServer("/", "localhost");
+    ws.handshake_done = true;
+    ws.leftover_start = 0;
+    ws.hs_len = 0;
+
+    // Build a 14-byte chunk with opcode 0x03 (reserved, invalid).
+    // Frame: FIN=1 opcode=3, unmasked, payload_len=0
+    // byte0=0x83 (FIN|opcode3), byte1=0x00, then 12 bytes of padding
+    var frame: [14]u8 = .{0x83, 0x00} ++ .{0x00} ** 12;
+    _ = try ws.feedNetworkData(&frame);
+
+    var buf: [64]u8 = undefined;
+    const result = ws.readDecrypted(&buf);
+    try testing.expectEqual(WsResult.err, result);
 }
 
 test "findHeaderValue case insensitive" {
