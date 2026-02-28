@@ -180,8 +180,12 @@ fn ymdToEpochDay(y_in: u16, m_in: u8, d_in: u8) i32 {
 
 /// Fixed-size log message for zero-allocation channel transport.
 /// Workers copy pre-formatted lines here; the writer coroutine flushes to disk.
-const LOG_MSG_DATA_SIZE: usize = 512;
-const LOG_CHANNEL_DEPTH: usize = 256;
+const LOG_MSG_DATA_SIZE: usize = 1024; // was 512 — avoids truncation of longer lines
+const LOG_CHANNEL_DEPTH: usize = 1024; // was 256 — prevents drops at 150+ concurrent sessions
+
+/// Per-destination write accumulation buffer size used by the writer coroutine.
+/// Messages for the same file are coalesced before each blockInPlace call.
+const WRITE_BUF_SIZE: usize = 8 * 1024;
 
 const LogMsg = struct {
     data: [LOG_MSG_DATA_SIZE]u8 = undefined,
@@ -205,42 +209,93 @@ fn doFileWrite(file: std.fs.File, data: []const u8) void {
     file.writeAll(data) catch {};
 }
 
+/// Accumulate one LogMsg into the per-destination write buffer, opening/rotating
+/// the log file as needed. Flushes the buffer via blockInPlace when it would overflow.
+/// Called from logWriterCoroutine for both the blocking first message and each
+/// tryReceive drain message.
+fn writerProcessMsg(
+    files: *[3]?std.fs.File,
+    current_days: *[3]i32,
+    write_bufs: *[3][WRITE_BUF_SIZE]u8,
+    write_lens: *[3]usize,
+    msg: LogMsg,
+) void {
+    const d = msg.dest;
+    if (d >= 3 or g_state.log_dir_len == 0) return;
+
+    // File rotation when the calendar day changes (rare: once per day).
+    if (msg.epoch_day != current_days[d]) {
+        // Flush buffered data before closing the old file.
+        if (write_lens[d] > 0) {
+            if (files[d]) |f| zio.blockInPlace(doFileWrite, .{ f, write_bufs[d][0..write_lens[d]] });
+            write_lens[d] = 0;
+        }
+        if (files[d]) |f| { f.close(); files[d] = null; }
+        var path_buf: [512]u8 = undefined;
+        const dir = g_state.log_dir_buf[0..g_state.log_dir_len];
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}_{d:0>4}-{d:0>2}-{d:0>2}.log", .{
+            dir, dest_names[d], msg.year, msg.month, msg.day,
+        }) catch {
+            current_days[d] = msg.epoch_day; // mark handled so we don't retry every message
+            return;
+        };
+        files[d] = openAppendFile(path);
+        current_days[d] = msg.epoch_day;
+    }
+
+    if (files[d] == null) return;
+
+    // Flush write buffer if this message would overflow it.
+    if (write_lens[d] + msg.len > WRITE_BUF_SIZE) {
+        if (files[d]) |f| zio.blockInPlace(doFileWrite, .{ f, write_bufs[d][0..write_lens[d]] });
+        write_lens[d] = 0;
+    }
+
+    @memcpy(write_bufs[d][write_lens[d]..][0..msg.len], msg.data[0..msg.len]);
+    write_lens[d] += msg.len;
+}
+
 /// Dedicated writer coroutine: owns all log file handles and writes asynchronously.
 /// Worker coroutines only copy into LogMsg and trySend — zero file I/O on the hot path.
-/// Each write is submitted to zio's thread pool via blockInPlace, so the executor
-/// thread is free to run other coroutines while disk I/O is in progress.
+///
+/// Batching strategy: after each blocking receive, drain all immediately available
+/// messages via tryReceive (non-blocking). All messages are accumulated into per-
+/// destination write buffers (WRITE_BUF_SIZE each). A single blockInPlace per
+/// destination flushes the batch, reducing thread-pool submissions from O(n messages)
+/// to O(destinations) per drain cycle.
 fn logWriterCoroutine() void {
     var files: [3]?std.fs.File = .{ null, null, null };
     var current_days: [3]i32 = .{ -1, -1, -1 };
+    var write_bufs: [3][WRITE_BUF_SIZE]u8 = undefined;
+    var write_lens: [3]usize = .{ 0, 0, 0 };
 
-    defer for (0..3) |i| {
-        if (files[i]) |f| f.close();
-    };
+    defer {
+        // Flush any remaining buffered data before exit.
+        for (0..3) |d| {
+            if (write_lens[d] > 0) {
+                if (files[d]) |f| zio.blockInPlace(doFileWrite, .{ f, write_bufs[d][0..write_lens[d]] });
+            }
+            if (files[d]) |f| f.close();
+        }
+    }
 
     while (true) {
-        const msg = g_log_channel.receive() catch break;
-        const d = msg.dest;
-        if (d >= 3 or g_state.log_dir_len == 0) continue;
+        // Suspend coroutine until at least one message arrives.
+        const first = g_log_channel.receive() catch break;
+        writerProcessMsg(&files, &current_days, &write_bufs, &write_lens, first);
 
-        // File rotation when the calendar day changes (rare: once per day).
-        if (msg.epoch_day != current_days[d]) {
-            if (files[d]) |f| {
-                f.close();
-                files[d] = null;
-            }
-            var path_buf: [512]u8 = undefined;
-            const dir = g_state.log_dir_buf[0..g_state.log_dir_len];
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}_{d:0>4}-{d:0>2}-{d:0>2}.log", .{
-                dir, dest_names[d], msg.year, msg.month, msg.day,
-            }) catch continue;
-            files[d] = openAppendFile(path); // sync open is fine (rotation is rare)
-            current_days[d] = msg.epoch_day;
+        // Drain all immediately available messages without suspending.
+        while (true) {
+            const msg = g_log_channel.tryReceive() catch break; // ChannelEmpty or ChannelClosed
+            writerProcessMsg(&files, &current_days, &write_bufs, &write_lens, msg);
         }
 
-        // Async write: submits to zio thread pool, suspends coroutine until done.
-        // The executor thread is released to run other coroutines during I/O.
-        if (files[d]) |f| {
-            zio.blockInPlace(doFileWrite, .{ f, msg.data[0..msg.len] });
+        // Flush all per-destination buffers: at most 3 blockInPlace calls per drain cycle.
+        for (0..3) |d| {
+            if (write_lens[d] > 0) {
+                if (files[d]) |f| zio.blockInPlace(doFileWrite, .{ f, write_bufs[d][0..write_lens[d]] });
+                write_lens[d] = 0;
+            }
         }
     }
 }
