@@ -29,8 +29,9 @@ pub const Buf = struct {
 };
 
 /// Maximum plaintext we encrypt per pool enc-slab call.
-/// Leaves 64 B headroom for all AEAD overhead (tag + length prefix + padding).
-pub const max_enc_per_slab: usize = slab_size - 64;
+/// VMess enc overhead: 2B size field + 16B AEAD tag + up to 63B global_padding = 81B max.
+/// Use 128B headroom to be safe against all protocol variants.
+pub const max_enc_per_slab: usize = slab_size - 128;
 
 /// Number of independent shards — must be a power of two.
 /// Match executor (thread) count so each thread gets its own shard: zero steady-state contention.

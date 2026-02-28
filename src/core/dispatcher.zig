@@ -174,7 +174,7 @@ pub const Dispatcher = struct {
 
     fn startListener(self: *Dispatcher, addr_str: []const u8, port: u16, listener_id: u8, group: *zio.Group) !void {
         const zio_addr = try parseZioAddress(addr_str, port);
-        const server = try zio_addr.listen(.{ .reuse_address = true });
+        const server = try zio_addr.listen(.{ .reuse_address = true, .kernel_backlog = std.math.maxInt(u31) });
         errdefer server.close();
 
         const sid: u8 = @intCast(self.servers.items.len);
@@ -193,6 +193,7 @@ pub const Dispatcher = struct {
             const stream = self.servers.items[server_idx].accept() catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 self.logger.err("accept error on lid={d}: {}", .{ listener_id, err });
+                zio.sleep(.fromMilliseconds(10)) catch return error.Canceled;
                 continue;
             };
 
