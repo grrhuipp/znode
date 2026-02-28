@@ -785,6 +785,18 @@ pub fn parseToml(allocator: std.mem.Allocator, content: []const u8) !Config {
         finalizeOutConfig(&route_list, pending_password, pending_cipher);
     }
 
+    // Check for duplicate panel names (empty name is allowed to repeat)
+    for (panel_list.items, 0..) |*a, i| {
+        const name_a = a.getName();
+        if (name_a.len == 0) continue;
+        for (panel_list.items[i + 1 ..]) |*b| {
+            if (std.mem.eql(u8, name_a, b.getName())) {
+                std.log.err("config: duplicate panel name \"{s}\"", .{name_a});
+                return error.DuplicatePanelName;
+            }
+        }
+    }
+
     // Expand multi-node-id panel entries: "node_id = 2011,1011" → 2 entries
     var expanded: std.ArrayList(NodeConfig) = .{};
     for (panel_list.items) |entry| {
@@ -1386,6 +1398,24 @@ test "parseToml with comma-separated node_id" {
     // Third entry: single node_id=99
     try std.testing.expectEqualStrings("single", config.panel[2].getName());
     try std.testing.expectEqual(@as(u32, 99), config.panel[2].node_id);
+}
+
+test "parseToml duplicate panel name is rejected" {
+    const allocator = std.testing.allocator;
+    const result = parseToml(allocator,
+        \\[[panel]]
+        \\name = "jx"
+        \\api_url = "https://panel.com"
+        \\api_key = "k1"
+        \\node_id = 1
+        \\
+        \\[[panel]]
+        \\name = "jx"
+        \\api_url = "https://panel2.com"
+        \\api_key = "k2"
+        \\node_id = 2
+    );
+    try std.testing.expectError(error.DuplicatePanelName, result);
 }
 
 test "parseToml without panel" {
