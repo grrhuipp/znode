@@ -183,6 +183,15 @@ fn doFileWrite(file: std.fs.File, data: []const u8) void {
     file.writeAll(data) catch {};
 }
 
+/// Thread-pool worker: write to stderr under the console mutex.
+/// Running this off the executor thread prevents blocking the event loop
+/// when stderr is a pipe (e.g. systemd journal) with a slow reader.
+fn doConsoleWrite(data: []const u8) void {
+    g_console_mutex.lock();
+    defer g_console_mutex.unlock();
+    std.debug.print("{s}", .{data});
+}
+
 /// No-op: Option B writes directly via blockInPlace; no background coroutine needed.
 pub fn startAsync() !void {}
 
@@ -199,10 +208,18 @@ const Channel = struct {
     prefix_len: u8 = 0,
     write_console: bool = false,
     fn writeLine(self: *Channel, line: []const u8, parts: TimeParts) void {
+        const in_runtime = zio.getCurrentExecutorOrNull() != null;
+
         if (self.write_console) {
-            g_console_mutex.lock();
-            defer g_console_mutex.unlock();
-            std.debug.print("{s}", .{line});
+            if (in_runtime) {
+                // Suspend the coroutine for the console write so the executor
+                // thread is never blocked by a slow/full stderr pipe.
+                zio.blockInPlace(doConsoleWrite, .{line});
+            } else {
+                g_console_mutex.lock();
+                defer g_console_mutex.unlock();
+                std.debug.print("{s}", .{line});
+            }
         }
 
         if (g_state.log_dir_len == 0) return;
@@ -215,9 +232,7 @@ const Channel = struct {
 
         const f = file orelse return;
 
-        // Inside zio runtime: suspend this coroutine during the write.
-        // Otherwise (startup/shutdown): write synchronously.
-        if (zio.getCurrentExecutorOrNull() != null) {
+        if (in_runtime) {
             zio.blockInPlace(doFileWrite, .{ f, line });
         } else {
             f.writeAll(line) catch {};
