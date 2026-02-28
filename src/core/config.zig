@@ -624,7 +624,11 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
 
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
 
-    var config = try parseToml(allocator, content);
+    var config = parseToml(allocator, content) catch |e| {
+        if (e == error.DuplicatePanelName)
+            std.log.err("config: duplicate panel name in {s}", .{path});
+        return e;
+    };
     config._file_data[0] = content;
 
     // Extract config directory from file path
@@ -791,7 +795,7 @@ pub fn parseToml(allocator: std.mem.Allocator, content: []const u8) !Config {
         if (name_a.len == 0) continue;
         for (panel_list.items[i + 1 ..]) |*b| {
             if (std.mem.eql(u8, name_a, b.getName())) {
-                std.log.err("config: duplicate panel name \"{s}\"", .{name_a});
+                panel_list.deinit(allocator);
                 return error.DuplicatePanelName;
             }
         }
