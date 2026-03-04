@@ -10,7 +10,7 @@ set -euo pipefail
 REPO="grrhuipp/znode"
 INSTALL_DIR="/opt/znode"
 SERVICE_NAME="znode"
-CONFIG_DIR="/opt/znode"
+CONFIG_DIR="/opt/znode/config"
 
 # 颜色
 RED='\033[0;31m'
@@ -110,7 +110,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/znode -c ${CONFIG_DIR}
+ExecStart=${INSTALL_DIR}/znode
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576

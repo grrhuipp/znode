@@ -91,16 +91,21 @@ pub fn main() !void {
     defer args.deinit();
 
     _ = args.next();
-    var config_path: []const u8 = "config";
+
+    // 默认加载二进制所在目录下的 config/
+    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_dir_buf) catch "znode";
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+    var config_path = try std.fs.path.join(arena, &.{ exe_dir, "config" });
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printHelp();
             return;
         }
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--dir")) {
             if (args.next()) |v| {
-                config_path = v;
+                config_path = try std.fs.path.join(arena, &.{ v, "config" });
             } else {
                 printHelp();
                 return;
@@ -122,7 +127,8 @@ pub fn main() !void {
 fn printHelp() void {
     std.debug.print(
         \\Usage: znode [options]
-        \\  -c, --config <path>   Config file or directory (default: config)
+        \\  -d, --dir <path>      Base directory (default: binary location)
+        \\                        Config loaded from <dir>/config/
         \\  -h, --help            Show help
         \\
     , .{});

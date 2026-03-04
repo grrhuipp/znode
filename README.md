@@ -30,13 +30,16 @@ Install directory: `/opt/znode/`
 
 ```
 /opt/znode/
-  znode          # binary
-  config.json    # main config
-  inbound.json
-  outbound.json
-  route.json
-  log/           # log files
+  znode              # binary
+  config/            # config directory (auto-detected)
+    config.json
+    inbound.json
+    outbound.json
+    route.json
+  log/               # log files
 ```
+
+Override base directory: `znode -d /path/to/dir` (loads `<dir>/config/`)
 
 ## Service
 
