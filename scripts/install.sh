@@ -29,17 +29,11 @@ detect_arch() {
     esac
 }
 
-# 获取最新版本号
-get_latest_version() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4
-}
-
 # 下载并安装
 install_binary() {
     local version=$1
     local arch=$2
-    local artifact="znode-linux-${arch}"
+    local artifact="znode-linux-${arch}-fast"
     local url="https://github.com/${REPO}/releases/download/${version}/${artifact}.tar.gz"
 
     info "下载 ${version} (${arch})..."
@@ -136,12 +130,7 @@ main() {
     local arch
     arch=$(detect_arch)
 
-    local version="${1:-}"
-    if [ -z "$version" ]; then
-        info "获取最新版本..."
-        version=$(get_latest_version)
-        [ -z "$version" ] && error "无法获取最新版本"
-    fi
+    local version="${1:-autobuild}"
     info "目标版本: ${version}"
 
     # 检查是否已安装相同版本
