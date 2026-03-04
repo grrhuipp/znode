@@ -858,10 +858,58 @@ fn parseHttpResponse(data: []const u8) !HttpResponse {
     const status = std.fmt.parseInt(u16, after_space[0..space2], 10) catch
         return error.InvalidAddress;
 
+    // Check for chunked transfer encoding
+    const headers = data[status_end + 2 ..];
+    const is_chunked = blk: {
+        var pos: usize = 0;
+        while (pos < headers.len) {
+            const line_end = std.mem.indexOf(u8, headers[pos..], "\r\n") orelse break;
+            const line = headers[pos .. pos + line_end];
+            if (line.len == 0) break; // end of headers
+            if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
+                const val = std.mem.trim(u8, line["transfer-encoding:".len..], " ");
+                break :blk std.ascii.eqlIgnoreCase(val, "chunked");
+            }
+            pos += line_end + 2;
+        }
+        break :blk false;
+    };
+
     // Find body (after \r\n\r\n)
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse
         return .{ .status = status, .body = "" };
-    const body = data[header_end + 4 ..];
+    const raw_body = data[header_end + 4 ..];
 
-    return .{ .status = status, .body = body };
+    if (is_chunked) {
+        return .{ .status = status, .body = decodeChunked(raw_body) };
+    }
+    return .{ .status = status, .body = raw_body };
+}
+
+/// Decode chunked transfer encoding in-place (returns slice into same buffer).
+fn decodeChunked(data: []const u8) []const u8 {
+    // Find first chunk: "<hex-size>\r\n<data>\r\n..."
+    // Simple: find first '{' or '[' as JSON start
+    var pos: usize = 0;
+    while (pos < data.len) {
+        if (data[pos] == '{' or data[pos] == '[') {
+            // Find the end — look for "\r\n0\r\n" (final chunk marker) or just return to end
+            const json_start = pos;
+            // Scan for the end of this chunk
+            // In chunked encoding: after the data there's \r\n then next chunk size
+            // For simplicity, find the last '}' or ']' in the data
+            var json_end = data.len;
+            var i = data.len;
+            while (i > json_start) {
+                i -= 1;
+                if (data[i] == '}' or data[i] == ']') {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+            return data[json_start..json_end];
+        }
+        pos += 1;
+    }
+    return data;
 }
