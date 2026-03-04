@@ -428,20 +428,20 @@ fn handleConnectionFiber(
     var tcp_stream = TcpStream.init(raw);
 
     peek_len = tcp_stream.read(&peek_buf) catch |err| {
-        logger.app(.debug, "{s} 首包读取失败: {s}", .{ pfx.str(), @errorName(err) });
+        logger.access("{s} REJECT read_error {s}", .{ pfx.str(), @errorName(err) });
         tcp_stream.close();
         return;
     };
     if (peek_len == 0) {
-        logger.app(.debug, "{s} 空连接 (客户端立即关闭)", .{pfx.str()});
+        logger.access("{s} REJECT empty_conn", .{pfx.str()});
         tcp_stream.close();
         return;
     }
 
-    // Debug: 首包 hex
+    // 首包 hex
     var first_hex_buf: [96]u8 = undefined;
     const first_hex = hexDump(peek_buf[0..@min(peek_len, 32)], &first_hex_buf);
-    logger.app(.debug, "{s} 首包 {d}B hex=[{s}]", .{ pfx.str(), peek_len, first_hex });
+    logger.access("{s} PEEK {d}B hex=[{s}]", .{ pfx.str(), peek_len, first_hex });
 
     const pp_result = proxy_protocol.parse(peek_buf[0..peek_len]);
     var pp_consumed: usize = 0;
@@ -453,8 +453,10 @@ fn handleConnectionFiber(
                 session_ctx.setClientIp(pp_result.srcIp());
                 session_ctx.client_port = pp_result.src_port;
                 pfx = connPrefix(&session_ctx);
+                logger.access("{s} PROXY real_ip={s}:{d}", .{
+                    pfx.str(), pp_result.srcIp(), pp_result.src_port,
+                });
             }
-            logger.app(.debug, "{s} PROXY_PROTOCOL ok consumed={d}B", .{ pfx.str(), pp_consumed });
         },
         .not_proxy => {
             pp_consumed = 0;
@@ -469,12 +471,15 @@ fn handleConnectionFiber(
                         session_ctx.setClientIp(pp2.srcIp());
                         session_ctx.client_port = pp2.src_port;
                         pfx = connPrefix(&session_ctx);
+                        logger.access("{s} PROXY real_ip={s}:{d}", .{
+                            pfx.str(), pp2.srcIp(), pp2.src_port,
+                        });
                     }
                 }
             } else |_| {}
         },
         .invalid => {
-            logger.app(.debug, "{s} PROXY_PROTOCOL 无效，关闭", .{pfx.str()});
+            logger.access("{s} REJECT invalid_proxy_protocol", .{pfx.str()});
             tcp_stream.close();
             return;
         },
