@@ -45,7 +45,7 @@ jobs:
           for a in "$@"; do
             if $skip; then skip=false; continue; fi
             case "$a" in
-              -Wp,*) ;;
+              -Wp,*|-fsanitize*) ;;
               --param) skip=true ;;
               *) args+=("$a") ;;
             esac
@@ -59,7 +59,7 @@ jobs:
           for a in "$@"; do
             if $skip; then skip=false; continue; fi
             case "$a" in
-              -Wp,*) ;;
+              -Wp,*|-fsanitize*) ;;
               --param) skip=true ;;
               *) args+=("$a") ;;
             esac
@@ -82,6 +82,8 @@ jobs:
             -DBUILD_TESTING=OFF \
             -DDISABLE_GO=ON \
             -DDISABLE_PERL=ON \
+            -DCMAKE_C_FLAGS="-fno-sanitize=all" \
+            -DCMAKE_CXX_FLAGS="-fno-sanitize=all" \
             -DCMAKE_ASM_FLAGS="-target ${{ matrix.target }}"
 
           ninja crypto ssl
