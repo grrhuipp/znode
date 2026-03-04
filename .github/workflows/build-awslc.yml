@@ -1,0 +1,108 @@
+name: Build aws-lc
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-awslc.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-awslc:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            arch: x86_64
+            lib_dir: x86_64-linux
+          - target: aarch64-linux-musl
+            arch: aarch64
+            lib_dir: aarch64-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Clone aws-lc
+        run: git clone --depth 1 --branch main https://github.com/aws/aws-lc.git /tmp/aws-lc-src
+
+      - name: Build aws-lc (${{ matrix.target }})
+        run: |
+          mkdir -p /tmp/zigcc
+          cat > /tmp/zigcc/zigcc <<ZIGCC
+          #!/bin/bash
+          zig cc -target ${{ matrix.target }} \$@
+          ZIGCC
+          cat > /tmp/zigcc/zigcxx <<ZIGCXX
+          #!/bin/bash
+          zig c++ -target ${{ matrix.target }} \$@
+          ZIGCXX
+          chmod +x /tmp/zigcc/zigcc /tmp/zigcc/zigcxx
+
+          mkdir -p /tmp/aws-lc-build
+          cd /tmp/aws-lc-build
+          cmake /tmp/aws-lc-src \
+            -GNinja \
+            -DCMAKE_C_COMPILER=/tmp/zigcc/zigcc \
+            -DCMAKE_CXX_COMPILER=/tmp/zigcc/zigcxx \
+            -DCMAKE_ASM_COMPILER=/tmp/zigcc/zigcc \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DDISABLE_GO=ON \
+            -DDISABLE_PERL=ON \
+            -DCMAKE_ASM_FLAGS="-target ${{ matrix.target }}"
+
+          ninja crypto ssl
+
+      - name: Copy libs
+        run: |
+          LIB_DIR=deps/aws-lc/lib/${{ matrix.lib_dir }}
+          mkdir -p $LIB_DIR
+          cp /tmp/aws-lc-build/crypto/libcrypto.a $LIB_DIR/
+          cp /tmp/aws-lc-build/ssl/libssl.a $LIB_DIR/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: awslc-${{ matrix.lib_dir }}
+          path: deps/aws-lc/lib/${{ matrix.lib_dir }}
+
+  commit:
+    needs: build-awslc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: awslc-x86_64-linux
+          path: deps/aws-lc/lib/x86_64-linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: awslc-aarch64-linux
+          path: deps/aws-lc/lib/aarch64-linux
+
+      - name: Commit libs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deps/aws-lc/lib/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: rebuild aws-lc static libs (musl, zig cc)"
+            git push
+          fi
