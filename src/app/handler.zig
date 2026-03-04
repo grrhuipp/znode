@@ -185,23 +185,29 @@ pub fn run(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         return;
     }
 
-    // Spawn listener fibers
-    var handles = try allocator.alloc(zio.JoinHandle(void), inbounds.len);
+    // Spawn listener fibers — each inbound × workers个 fiber (SO_REUSEPORT)
+    const workers: usize = @intCast(cfg.workers);
+    const max_fibers = inbounds.len * workers;
+    var handles = try allocator.alloc(zio.JoinHandle(void), max_fibers);
     var handle_count: usize = 0;
 
     for (inbounds) |*inbound| {
         if (inbound.protocol == .unsupported) continue;
-        handles[handle_count] = zio.spawn(listenerFiber, .{ &runtime, inbound }) catch {
-            logger.console("监听 fiber 启动失败: tag={s}", .{inbound.tag});
-            continue;
-        };
-        logger.console("监听启动: tag={s} protocol={s} {s}:{d}", .{
+        var w: usize = 0;
+        while (w < workers) : (w += 1) {
+            handles[handle_count] = zio.spawn(listenerFiber, .{ &runtime, inbound, w }) catch {
+                logger.console("监听 fiber 启动失败: tag={s} worker={d}", .{ inbound.tag, w });
+                continue;
+            };
+            handle_count += 1;
+        }
+        logger.console("监听启动: tag={s} protocol={s} {s}:{d} workers={d}", .{
             inbound.tag,
             @tagName(inbound.protocol),
             inbound.listen,
             inbound.port,
+            workers,
         });
-        handle_count += 1;
     }
 
     if (handle_count == 0) {
@@ -351,42 +357,48 @@ fn speedLimitBytes(mbps: i64) u64 {
 
 // ── Listener ─────────────────────────────────────────────────────────────
 
-fn listenerFiber(runtime: *Runtime, inbound: *const InboundRuntime) void {
+fn listenerFiber(runtime: *Runtime, inbound: *const InboundRuntime, worker_id: usize) void {
     const logger = log.getLogger();
-    listenerLoop(runtime, inbound) catch |err| {
-        logger.console("监听 fiber 异常退出: tag={s} err={s}", .{ inbound.tag, @errorName(err) });
+    listenerLoop(runtime, inbound, worker_id) catch |err| {
+        logger.console("监听 fiber 异常退出: tag={s} worker={d} err={s}", .{ inbound.tag, worker_id, @errorName(err) });
     };
 }
 
-fn listenerLoop(runtime: *Runtime, inbound: *const InboundRuntime) !void {
+fn listenerLoop(runtime: *Runtime, inbound: *const InboundRuntime, worker_id: usize) !void {
     const logger = log.getLogger();
     const address = try zio.net.IpAddress.parseIp(inbound.listen, inbound.port);
-    var server = try address.listen(.{
-        .reuse_address = true,
-        .kernel_backlog = 1024,
-    });
+
+    // 手动创建 socket: SO_REUSEADDR + SO_REUSEPORT → bind → listen
+    // 每个 worker 独立 listener，内核负载均衡分发连接
+    var socket = try zio.net.Socket.open(.stream, .fromPosix(address.any.family), .ip);
+    errdefer socket.close();
+    try socket.setReuseAddress(true);
+    try socket.setReusePort(true);
+    try socket.bind(.{ .ip = address });
+    try socket.listen(1024);
+    var server = zio.net.Server{ .socket = socket };
     defer server.close();
 
-    logger.app(.info, "监听启动: tag={s} protocol={s} {s}:{d}", .{
+    logger.app(.info, "worker 监听就绪: tag={s} worker={d} {s}:{d}", .{
         inbound.tag,
-        @tagName(inbound.protocol),
+        worker_id,
         inbound.listen,
         inbound.port,
     });
 
     while (true) {
         const stream = server.accept() catch |err| {
-            logger.app(.warn, "accept 失败: tag={s} err={s}", .{ inbound.tag, @errorName(err) });
+            logger.app(.warn, "accept 失败: tag={s} worker={d} err={s}", .{ inbound.tag, worker_id, @errorName(err) });
             continue;
         };
 
-        const shard = runtime.stats.getShard(0);
+        const shard = runtime.stats.getShard(@intCast(worker_id));
         shard.onAccepted();
         var handle = zio.spawn(handleConnectionFiber, .{ runtime, inbound, stream }) catch |err| {
             shard.onClosed();
             shard.onError();
             stream.close();
-            logger.app(.warn, "fiber 派发失败: tag={s} err={s}", .{ inbound.tag, @errorName(err) });
+            logger.app(.warn, "fiber 派发失败: tag={s} worker={d} err={s}", .{ inbound.tag, worker_id, @errorName(err) });
             continue;
         };
         handle.detach();
