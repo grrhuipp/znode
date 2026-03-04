@@ -365,7 +365,16 @@ fn fetchNodeConfig(
     );
 
     const response = try httpGet(allocator, panel.api_host, path, panel.api_key);
-    return parseNodeConfigJson(allocator, response.body);
+    if (response.status != 200) {
+        std.log.warn("面板配置请求失败: status={d}", .{response.status});
+    }
+    const cfg = parseNodeConfigJson(allocator, response.body);
+    if (cfg.server_port == 0) {
+        // 打印原始响应帮助调试
+        const preview_len = @min(response.body.len, 512);
+        std.log.warn("面板配置解析 port=0: node={d} body={s}", .{ node_id, response.body[0..preview_len] });
+    }
+    return cfg;
 }
 
 fn parseNodeConfigJson(allocator: std.mem.Allocator, body: []const u8) NodeConfig {
