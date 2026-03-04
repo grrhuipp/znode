@@ -690,7 +690,7 @@ fn parsePanelsConfig(allocator: std.mem.Allocator, value: std.json.Value) ![]con
 
 fn parsePanelObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !PanelConfig {
     var node_ids = std.array_list.Managed(i64).init(allocator);
-    if (getFieldAny(obj, &.{ "nodeIds", "NodeIds", "node_ids" })) |v| {
+    if (getFieldAny(obj, &.{ "NodeID", "nodeIds", "NodeIds", "node_ids" })) |v| {
         if (v == .array) {
             for (v.array.items) |item| {
                 if (valueToInt(item)) |n| {

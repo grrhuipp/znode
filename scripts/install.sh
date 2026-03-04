@@ -68,11 +68,11 @@ setup_config() {
 {
   "Workers": 0,
   "Log": {
-    "level": "info",
-    "output": "/opt/znode/log"
+    "Level": "info",
+    "LogDir": "/opt/znode/log"
   },
   "Dns": {
-    "servers": ["8.8.8.8", "1.1.1.1"]
+    "Servers": ["8.8.8.8", "1.1.1.1"]
   }
 }
 CONF
