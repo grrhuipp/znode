@@ -1,0 +1,74 @@
+[
+  {
+    "tag": "trojan-in",
+    "protocol": "trojan",
+    "listen": "0.0.0.0",
+    "port": 8443,
+    "outboundTag": "direct",
+    "settings": {
+      "clients": [
+        {
+          "password": "your-trojan-password",
+          "email": "user1@example.com",
+          "user_id": 1,
+          "speed_limit": 0
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tls": {
+        "cert_file": "/etc/ssl/cert.pem",
+        "key_file": "/etc/ssl/key.pem"
+      }
+    },
+    "sniffing": {
+      "enabled": true,
+      "override_dest": false
+    }
+  },
+  {
+    "tag": "vmess-in",
+    "protocol": "vmess",
+    "listen": "0.0.0.0",
+    "port": 10086,
+    "settings": {
+      "clients": [
+        {
+          "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "email": "vmess-user@example.com",
+          "user_id": 2,
+          "speed_limit": 100
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tls": {
+        "cert_file": "/etc/ssl/cert.pem",
+        "key_file": "/etc/ssl/key.pem"
+      },
+      "ws": {
+        "path": "/vmess"
+      }
+    }
+  },
+  {
+    "tag": "ss-in",
+    "protocol": "shadowsocks",
+    "listen": "0.0.0.0",
+    "port": 8388,
+    "settings": {
+      "clients": [
+        {
+          "password": "your-ss-password",
+          "email": "ss-user@example.com",
+          "user_id": 3,
+          "speed_limit": 0
+        }
+      ]
+    }
+  }
+]

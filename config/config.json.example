@@ -1,0 +1,37 @@
+{
+  "Workers": 4,
+  "Log": {
+    "level": "info",
+    "log_dir": "/var/log/znode",
+    "max_days": 15
+  },
+  "Dns": {
+    "servers": ["8.8.8.8", "1.1.1.1"],
+    "timeout": 5,
+    "cache_size": 10000
+  },
+  "Timeouts": {
+    "handshake": 4,
+    "dial": 10,
+    "read": 15,
+    "write": 30,
+    "idle": 300,
+    "uplink_only": 2,
+    "downlink_only": 5
+  },
+  "Limits": {
+    "auth_fail_limit": 10,
+    "auth_fail_window": 60,
+    "auth_ban_seconds": 180
+  },
+  "Panels": [
+    {
+      "name": "panel1",
+      "panel_type": "V2Board",
+      "api_host": "https://panel.example.com",
+      "api_key": "your-api-key",
+      "node_ids": [1],
+      "node_type": "trojan"
+    }
+  ]
+}

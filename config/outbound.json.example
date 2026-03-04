@@ -1,0 +1,50 @@
+[
+  {
+    "tag": "direct",
+    "protocol": "freedom"
+  },
+  {
+    "tag": "blackhole",
+    "protocol": "blackhole"
+  },
+  {
+    "tag": "trojan-proxy",
+    "protocol": "trojan",
+    "address": "proxy.example.com",
+    "port": 443,
+    "password": "proxy-trojan-password",
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tls": {
+        "server_name": "proxy.example.com"
+      }
+    }
+  },
+  {
+    "tag": "vmess-proxy",
+    "protocol": "vmess",
+    "address": "proxy2.example.com",
+    "port": 443,
+    "uuid": "a3482e88-686a-4a58-8126-99c9034f6b52",
+    "security": "aes-128-gcm",
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "tls": {
+        "server_name": "proxy2.example.com"
+      },
+      "ws": {
+        "path": "/vmess"
+      }
+    }
+  },
+  {
+    "tag": "ss-proxy",
+    "protocol": "shadowsocks",
+    "address": "proxy3.example.com",
+    "port": 8388,
+    "password": "proxy-ss-password",
+    "method": "aes-128-gcm"
+  }
+]

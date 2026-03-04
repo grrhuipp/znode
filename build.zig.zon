@@ -1,0 +1,17 @@
+.{
+    .name = .znode,
+    .version = "0.1.0",
+    .fingerprint = 0xd17b382a348698cb,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.9.0#d946751b10346c576e48b053f08fb2e464fd1333",
+            .hash = "zio-0.9.0-xHbVVE7iGAAsh0YoqPxIjNi8_dCMLL-55OCbZDE-SaIS",
+        },
+    },
+}
