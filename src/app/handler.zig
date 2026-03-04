@@ -415,7 +415,6 @@ fn handleConnectionFiber(
     const shard = runtime.stats.getShard(0);
     defer shard.onClosed();
 
-    // Create session context and extract client IP + port
     var session_ctx = session_mod.SessionContext.init();
     session_ctx.setInboundTag(inbound.tag);
     extractClientAddr(&session_ctx, raw.socket.address.toStd());
@@ -423,29 +422,26 @@ fn handleConnectionFiber(
     const logger = log.getLogger();
     var pfx = connPrefix(&session_ctx);
 
-    logger.access("{s} ACCEPTED protocol={s}", .{ pfx.str(), @tagName(inbound.protocol) });
-
     // ── Proxy Protocol 自动检测 ─────────────────────────────────────────
     var peek_buf: [2048]u8 = undefined;
     var peek_len: usize = 0;
     var tcp_stream = TcpStream.init(raw);
 
-    // 读第一块数据
     peek_len = tcp_stream.read(&peek_buf) catch |err| {
-        logger.access("{s} FIRST_READ_ERROR err={s}", .{ pfx.str(), @errorName(err) });
+        logger.app(.debug, "{s} 首包读取失败: {s}", .{ pfx.str(), @errorName(err) });
         tcp_stream.close();
         return;
     };
     if (peek_len == 0) {
-        logger.access("{s} EMPTY_CONN (0 bytes received, client closed immediately)", .{pfx.str()});
+        logger.app(.debug, "{s} 空连接 (客户端立即关闭)", .{pfx.str()});
         tcp_stream.close();
         return;
     }
 
-    // 记录收到的首包数据摘要
+    // Debug: 首包 hex
     var first_hex_buf: [96]u8 = undefined;
     const first_hex = hexDump(peek_buf[0..@min(peek_len, 32)], &first_hex_buf);
-    logger.access("{s} FIRST_READ {d}bytes hex=[{s}]", .{ pfx.str(), peek_len, first_hex });
+    logger.app(.debug, "{s} 首包 {d}B hex=[{s}]", .{ pfx.str(), peek_len, first_hex });
 
     const pp_result = proxy_protocol.parse(peek_buf[0..peek_len]);
     var pp_consumed: usize = 0;
@@ -456,29 +452,16 @@ fn handleConnectionFiber(
             if (pp_result.src_ip_len > 0) {
                 session_ctx.setClientIp(pp_result.srcIp());
                 session_ctx.client_port = pp_result.src_port;
-                // 更新前缀
                 pfx = connPrefix(&session_ctx);
-                logger.access("{s} PROXY_PROTOCOL_OK real_ip={s}:{d} consumed={d}bytes", .{
-                    pfx.str(),
-                    pp_result.srcIp(),
-                    pp_result.src_port,
-                    pp_consumed,
-                });
-            } else {
-                logger.access("{s} PROXY_PROTOCOL_OK (LOCAL/unknown) consumed={d}bytes", .{ pfx.str(), pp_consumed });
             }
+            logger.app(.debug, "{s} PROXY_PROTOCOL ok consumed={d}B", .{ pfx.str(), pp_consumed });
         },
         .not_proxy => {
-            // 不是 proxy protocol，所有数据回流
             pp_consumed = 0;
-            logger.access("{s} PROXY_PROTOCOL_SKIP (not proxy protocol header)", .{pfx.str()});
         },
         .incomplete => {
-            logger.access("{s} PROXY_PROTOCOL_INCOMPLETE (partial match, reading more)", .{pfx.str()});
-            // 部分匹配但不完整 — 尝试再读一次
             if (tcp_stream.read(peek_buf[peek_len..])) |n2| {
                 peek_len += n2;
-                logger.access("{s} PROXY_PROTOCOL_RETRY total={d}bytes", .{ pfx.str(), peek_len });
                 const pp2 = proxy_protocol.parse(peek_buf[0..peek_len]);
                 if (pp2.status == .success) {
                     pp_consumed = pp2.consumed;
@@ -486,50 +469,27 @@ fn handleConnectionFiber(
                         session_ctx.setClientIp(pp2.srcIp());
                         session_ctx.client_port = pp2.src_port;
                         pfx = connPrefix(&session_ctx);
-                        logger.access("{s} PROXY_PROTOCOL_OK real_ip={s}:{d} consumed={d}bytes", .{
-                            pfx.str(),
-                            pp2.srcIp(),
-                            pp2.src_port,
-                            pp_consumed,
-                        });
                     }
-                } else {
-                    logger.access("{s} PROXY_PROTOCOL_RETRY_FAILED status={s}", .{ pfx.str(), @tagName(pp2.status) });
                 }
-                // 其他情况 pp_consumed 保持 0，当做非 proxy protocol
-            } else |err| {
-                logger.access("{s} PROXY_PROTOCOL_RETRY_READ_ERROR err={s}", .{ pfx.str(), @errorName(err) });
-                // 读不到更多，当做非 proxy protocol
-            }
+            } else |_| {}
         },
         .invalid => {
-            logger.access("{s} PROXY_PROTOCOL_INVALID closing", .{pfx.str()});
+            logger.app(.debug, "{s} PROXY_PROTOCOL 无效，关闭", .{pfx.str()});
             tcp_stream.close();
             return;
         },
     }
 
-    // 构建 PrefixedStream（剩余未消费的 peek 数据作为 pending）
     const remaining = peek_buf[pp_consumed..peek_len];
     var client_stream = PrefixedStream.init(tcp_stream, remaining);
     defer client_stream.close();
-
-    // 记录分发到协议层的数据摘要
-    var dispatch_hex_buf: [96]u8 = undefined;
-    const dispatch_hex = hexDump(remaining[0..@min(remaining.len, 32)], &dispatch_hex_buf);
-    logger.access("{s} DISPATCH protocol={s} pending={d}bytes hex=[{s}]", .{
-        pfx.str(),
-        @tagName(inbound.protocol),
-        remaining.len,
-        dispatch_hex,
-    });
 
     switch (inbound.handler) {
         .trojan => |*ctx| handleTrojan(runtime, inbound, ctx, &client_stream, shard, &session_ctx, &pfx),
         .vmess => |*ctx| handleVMess(runtime, inbound, ctx, &client_stream, shard, &session_ctx, &pfx),
         .ss => |*ctx| handleSs(runtime, inbound, ctx, &client_stream, shard, &session_ctx, &pfx),
         .none => {
-            logger.access("{s} NO_HANDLER (unsupported protocol)", .{pfx.str()});
+            logger.connError("{s} REJECT 不支持的协议", .{pfx.str()});
             shard.onError();
         },
     }
@@ -624,44 +584,34 @@ fn handleTrojan(
     pfx: *const ConnPrefix,
 ) void {
     const logger = log.getLogger();
-
-    const user_count = ctx.user_manager.count();
-    logger.access("{s} TROJAN_AUTH_START users={d}", .{ pfx.str(), user_count });
-
     const handler = trojan_inbound.TrojanInboundHandler.init(&ctx.user_manager);
-    const parsed = handler.parseStream(
-        PrefixedStream,
-        client_stream,
-        session_ctx,
-    ) catch |err| {
+    const parsed = handler.parseStream(PrefixedStream, client_stream, session_ctx) catch |err| {
         shard.onError();
         var hdr_hex_buf: [170]u8 = undefined;
         const pending_data = client_stream.pending[0..client_stream.pending_len];
         const hdr_hex = hexDump(pending_data[0..@min(pending_data.len, 56)], &hdr_hex_buf);
-        logger.connError("{s} AUTH_FAILED trojan err={s} users={d} pending_head=[{s}]", .{
-            pfx.str(),
-            @errorName(err),
-            user_count,
-            hdr_hex,
+        logger.connError("{s} REJECT trojan {s} users={d} hex=[{s}]", .{
+            pfx.str(), @errorName(err), ctx.user_manager.count(), hdr_hex,
         });
         return;
     };
-
-    logger.access("{s} AUTH_OK trojan user_id={d} email={s} cmd={s} initial_payload={d}bytes -> {s}:{d}", .{
-        pfx.str(),
-        session_ctx.user_id,
-        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
-        @tagName(parsed.network),
-        parsed.initial_payload.len,
-        parsed.target.host(),
-        parsed.target.port,
-    });
 
     session_ctx.transitionTo(.sniffing);
     doSniff(inbound, session_ctx, parsed.initial_payload, parsed.target.port, pfx);
     session_ctx.transitionTo(.routing);
 
-    // Trojan inbound: client stream is raw (encryption handled by TLS)
+    // OPEN: 认证成功，记录连接信息
+    const sniffed = if (!session_ctx.sniffed_target.isEmpty()) session_ctx.sniffed_target.host() else "";
+    logger.access("{s} OPEN trojan uid={d} {s} -> {s}:{d}{s}{s}", .{
+        pfx.str(),
+        session_ctx.user_id,
+        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
+        parsed.target.host(),
+        parsed.target.port,
+        if (sniffed.len > 0) " sniff=" else "",
+        sniffed,
+    });
+
     var client_adapter = StreamAdapter.from(PrefixedStream, client_stream);
     doOutboundAndRelay(runtime, inbound, session_ctx, shard, &client_adapter, parsed.initial_payload, logger, pfx);
 }
@@ -678,84 +628,51 @@ fn handleVMess(
     pfx: *const ConnPrefix,
 ) void {
     const logger = log.getLogger();
-
-    const user_count = ctx.user_manager.users.len;
-    logger.access("{s} VMESS_AUTH_START users={d} server_time={d}", .{
-        pfx.str(),
-        user_count,
-        std.time.timestamp(),
-    });
-
     const handler = vmess_inbound.VMessInboundHandler.init(&ctx.user_manager);
-    const parsed = handler.parseStream(
-        PrefixedStream,
-        client_stream,
-        session_ctx,
-    ) catch |err| {
+    const parsed = handler.parseStream(PrefixedStream, client_stream, session_ctx) catch |err| {
         shard.onError();
-        // 获取 pending 数据的前 16 字节 (AuthID) 用于调试
         var auth_hex_buf: [96]u8 = undefined;
         const pending_data = client_stream.pending[0..client_stream.pending_len];
         const auth_hex = hexDump(pending_data[0..@min(pending_data.len, 16)], &auth_hex_buf);
-        logger.connError("{s} AUTH_FAILED vmess err={s} users={d} pending_head=[{s}]", .{
-            pfx.str(),
-            @errorName(err),
-            user_count,
-            auth_hex,
+        logger.connError("{s} REJECT vmess {s} users={d} hex=[{s}]", .{
+            pfx.str(), @errorName(err), ctx.user_manager.users.len, auth_hex,
         });
         return;
     };
 
-    logger.access("{s} AUTH_OK vmess user_id={d} email={s} security={s} cmd={s} opt=0x{x:0>2} -> {s}:{d}", .{
-        pfx.str(),
-        session_ctx.user_id,
-        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
-        @tagName(parsed.request.security),
-        @tagName(parsed.request.command),
-        parsed.request.options,
-        session_ctx.target.host(),
-        session_ctx.target.port,
-    });
-
     // Send VMess AEAD response header
-    logger.access("{s} VMESS_SEND_RESPONSE", .{pfx.str()});
-    vmess_inbound.VMessInboundHandler.sendResponse(
-        PrefixedStream,
-        client_stream,
-        &parsed.request,
-    ) catch |err| {
+    vmess_inbound.VMessInboundHandler.sendResponse(PrefixedStream, client_stream, &parsed.request) catch |err| {
         shard.onError();
-        logger.connError("{s} VMESS_RESPONSE_SEND_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+        logger.connError("{s} ERROR vmess response_send {s}", .{ pfx.str(), @errorName(err) });
         return;
     };
-    logger.access("{s} VMESS_RESPONSE_SENT", .{pfx.str()});
 
     session_ctx.transitionTo(.routing);
 
+    // OPEN: 认证成功
+    logger.access("{s} OPEN vmess uid={d} {s} -> {s}:{d} security={s}", .{
+        pfx.str(),
+        session_ctx.user_id,
+        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
+        session_ctx.target.host(),
+        session_ctx.target.port,
+        @tagName(parsed.request.security),
+    });
+
     // Wrap client stream with VMessStream for AEAD chunk relay
     const cipher = parsed.request.security.toAeadCipher() orelse {
-        // security=none/zero: relay raw
-        logger.access("{s} VMESS_WRAP security=none/zero (raw relay)", .{pfx.str()});
         var client_adapter = StreamAdapter.from(PrefixedStream, client_stream);
         doOutboundAndRelay(runtime, inbound, session_ctx, shard, &client_adapter, &.{}, logger, pfx);
         return;
     };
 
-    logger.access("{s} VMESS_WRAP cipher={s}", .{ pfx.str(), @tagName(cipher) });
-
     var vmess_client = vmess_stream_mod.VMessStream(PrefixedStream).init(
-        client_stream.*,
-        cipher,
-        parsed.request.body_key,
-        parsed.request.body_iv,
-        parsed.request.response_key,
-        parsed.request.response_iv,
+        client_stream.*, cipher,
+        parsed.request.body_key, parsed.request.body_iv,
+        parsed.request.response_key, parsed.request.response_iv,
         parsed.request.options,
     );
-    var client_adapter = StreamAdapter.from(
-        vmess_stream_mod.VMessStream(PrefixedStream),
-        &vmess_client,
-    );
+    var client_adapter = StreamAdapter.from(vmess_stream_mod.VMessStream(PrefixedStream), &vmess_client);
     doOutboundAndRelay(runtime, inbound, session_ctx, shard, &client_adapter, &.{}, logger, pfx);
 }
 
@@ -771,50 +688,41 @@ fn handleSs(
     pfx: *const ConnPrefix,
 ) void {
     const logger = log.getLogger();
-
-    const user_count = ctx.user_manager.users.len;
-    logger.access("{s} SS_AUTH_START users={d}", .{ pfx.str(), user_count });
-
     const handler = ss_inbound.SsInboundHandler.init(&ctx.user_manager);
-    const parsed = handler.parseStream(
-        PrefixedStream,
-        client_stream,
-        session_ctx,
-    ) catch |err| {
+    const parsed = handler.parseStream(PrefixedStream, client_stream, session_ctx) catch |err| {
         shard.onError();
         var salt_hex_buf: [96]u8 = undefined;
         const pending_data = client_stream.pending[0..client_stream.pending_len];
         const salt_hex = hexDump(pending_data[0..@min(pending_data.len, 32)], &salt_hex_buf);
-        logger.connError("{s} AUTH_FAILED ss err={s} users={d} pending_head=[{s}]", .{
-            pfx.str(),
-            @errorName(err),
-            user_count,
-            salt_hex,
+        logger.connError("{s} REJECT ss {s} users={d} hex=[{s}]", .{
+            pfx.str(), @errorName(err), ctx.user_manager.users.len, salt_hex,
         });
         return;
     };
-
-    logger.access("{s} AUTH_OK ss user_id={d} email={s} cipher={s} initial_payload={d}bytes -> {s}:{d}", .{
-        pfx.str(),
-        session_ctx.user_id,
-        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
-        @tagName(parsed.cipher_type),
-        parsed.initial_payload.len,
-        parsed.target.host(),
-        parsed.target.port,
-    });
 
     session_ctx.transitionTo(.sniffing);
     doSniff(inbound, session_ctx, parsed.initial_payload, parsed.target.port, pfx);
     session_ctx.transitionTo(.routing);
 
-    // Generate write subkey for server→client direction
-    logger.access("{s} SS_KEYGEN generating write subkey", .{pfx.str()});
+    // OPEN: 认证成功
+    const sniffed = if (!session_ctx.sniffed_target.isEmpty()) session_ctx.sniffed_target.host() else "";
+    logger.access("{s} OPEN ss uid={d} {s} -> {s}:{d} cipher={s}{s}{s}", .{
+        pfx.str(),
+        session_ctx.user_id,
+        if (session_ctx.user_email_len > 0) session_ctx.userEmail() else "-",
+        parsed.target.host(),
+        parsed.target.port,
+        @tagName(parsed.cipher_type),
+        if (sniffed.len > 0) " sniff=" else "",
+        sniffed,
+    });
+
+    // Generate write subkey
     var write_salt: [ss_protocol.max_salt_len]u8 = undefined;
     var write_subkey: [ss_protocol.max_key_len]u8 = undefined;
     ss_protocol.generateSalt(write_salt[0..parsed.read_subkey_len]) catch |err| {
         shard.onError();
-        logger.connError("{s} SS_SALT_GEN_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+        logger.connError("{s} ERROR ss salt_gen {s}", .{ pfx.str(), @errorName(err) });
         return;
     };
     ss_protocol.deriveSessionKey(
@@ -823,25 +731,19 @@ fn handleSs(
         write_subkey[0..parsed.read_subkey_len],
     ) catch |err| {
         shard.onError();
-        logger.connError("{s} SS_SUBKEY_DERIVE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+        logger.connError("{s} ERROR ss subkey_derive {s}", .{ pfx.str(), @errorName(err) });
         return;
     };
 
-    // Wrap client stream with SsStream for AEAD chunk relay
-    logger.access("{s} SS_WRAP cipher={s}", .{ pfx.str(), @tagName(parsed.cipher_type) });
     var ss_client = ss_stream_mod.SsStream(PrefixedStream).init(
-        client_stream.*,
-        parsed.cipher_type,
+        client_stream.*, parsed.cipher_type,
         parsed.read_subkey[0..parsed.read_subkey_len],
         write_subkey[0..parsed.read_subkey_len],
         write_salt[0..parsed.read_subkey_len],
     );
     ss_client.read_nonce_counter = parsed.first_chunk_nonce;
 
-    var client_adapter = StreamAdapter.from(
-        ss_stream_mod.SsStream(PrefixedStream),
-        &ss_client,
-    );
+    var client_adapter = StreamAdapter.from(ss_stream_mod.SsStream(PrefixedStream), &ss_client);
     doOutboundAndRelay(runtime, inbound, session_ctx, shard, &client_adapter, parsed.initial_payload, logger, pfx);
 }
 
@@ -854,39 +756,14 @@ fn doSniff(
     fallback_port: u16,
     pfx: *const ConnPrefix,
 ) void {
-    const logger = log.getLogger();
-    if (!inbound.sniff_enabled) {
-        logger.access("{s} SNIFF_SKIP (disabled)", .{pfx.str()});
-        return;
-    }
-    if (payload.len == 0) {
-        logger.access("{s} SNIFF_SKIP (no payload)", .{pfx.str()});
-        return;
-    }
+    if (!inbound.sniff_enabled or payload.len == 0) return;
 
-    logger.access("{s} SNIFF_START payload={d}bytes", .{ pfx.str(), payload.len });
-    const result = sniffer.sniff(payload) orelse {
-        logger.access("{s} SNIFF_NONE (no SNI/Host detected)", .{pfx.str()});
-        return;
-    };
+    const result = sniffer.sniff(payload) orelse return;
     ctx.sniffed_target = result.toTarget(fallback_port);
     if (inbound.sniff_override) {
         ctx.final_target = ctx.sniffed_target;
-        logger.access("{s} SNIFF_OVERRIDE {s} -> {s}:{d}", .{
-            pfx.str(),
-            ctx.target.host(),
-            ctx.sniffed_target.host(),
-            ctx.sniffed_target.port,
-        });
-    } else {
-        logger.access("{s} SNIFF_DETECTED {s}:{d} (no override, keeping original {s}:{d})", .{
-            pfx.str(),
-            ctx.sniffed_target.host(),
-            ctx.sniffed_target.port,
-            ctx.target.host(),
-            ctx.target.port,
-        });
     }
+    _ = pfx;
 }
 
 /// Route + dial + outbound handshake + relay.
@@ -901,81 +778,44 @@ fn doOutboundAndRelay(
     pfx: *const ConnPrefix,
 ) void {
     const effective = ctx.effectiveTarget();
-
-    // 路由决策
-    if (inbound.fixed_outbound) |fixed| {
-        logger.access("{s} ROUTE fixed_outbound={s} target={s}:{d}", .{
-            pfx.str(), fixed, effective.host(), effective.port,
-        });
-    }
     const outbound_tag = inbound.fixed_outbound orelse runtime.router.route(effective);
     ctx.setOutboundTag(outbound_tag);
-
-    logger.access("{s} ROUTE_RESULT target={s}:{d} via={s} original={s}:{d} sniffed={s}:{d}", .{
-        pfx.str(),
-        effective.host(),
-        effective.port,
-        outbound_tag,
-        ctx.target.host(),
-        ctx.target.port,
-        if (!ctx.sniffed_target.isEmpty()) ctx.sniffed_target.host() else "-",
-        ctx.sniffed_target.port,
-    });
 
     const outbound = runtime.outbounds.find(outbound_tag) orelse {
         shard.onError();
         ctx.setError(.router_outbound_not_found);
-        logger.connError("{s} OUTBOUND_NOT_FOUND tag={s} (available: check config)", .{ pfx.str(), outbound_tag });
+        logger.connError("{s} ERROR outbound_not_found tag={s}", .{ pfx.str(), outbound_tag });
         return;
     };
 
-    logger.access("{s} OUTBOUND_FOUND tag={s} kind={s}", .{
-        pfx.str(), outbound_tag, @tagName(outbound.kind),
-    });
-
     if (outbound.kind == .blackhole) {
-        logger.access("{s} BLACKHOLE dropping connection", .{pfx.str()});
         ctx.transitionTo(.closed);
         return;
     }
 
-    // Determine dial target
+    // Dial target
     const dial_target = switch (outbound.kind) {
-        .trojan, .vmess, .shadowsocks => DialTarget{
-            .host = outbound.address,
-            .port = outbound.port,
-        },
-        .freedom => DialTarget{
-            .host = effective.host(),
-            .port = effective.port,
-        },
+        .trojan, .vmess, .shadowsocks => DialTarget{ .host = outbound.address, .port = outbound.port },
+        .freedom => DialTarget{ .host = effective.host(), .port = effective.port },
         .blackhole => return,
     };
 
     ctx.transitionTo(.dialing);
-    logger.access("{s} DIALING {s}:{d} (outbound={s})", .{ pfx.str(), dial_target.host, dial_target.port, outbound_tag });
-
     var target_tcp = connectTarget(runtime.allocator, dial_target) catch |err| {
         shard.onError();
         ctx.setError(.dial_connect_failed);
-        logger.connError("{s} DIAL_FAILED {s}:{d} via={s} err={s}", .{
+        logger.connError("{s} ERROR dial {s}:{d} via={s} {s}", .{
             pfx.str(), dial_target.host, dial_target.port, outbound_tag, @errorName(err),
         });
         return;
     };
     defer target_tcp.close();
 
-    logger.access("{s} DIAL_OK {s}:{d}", .{ pfx.str(), dial_target.host, dial_target.port });
-
     ctx.transitionTo(.relaying);
     const cfg = relayConfig(ctx, runtime);
-    logger.access("{s} RELAY_START initial_payload={d}bytes speed_limit={d}", .{
-        pfx.str(), initial_payload.len, cfg.speed_limit,
-    });
 
     switch (outbound.kind) {
         .freedom => {
-            logger.access("{s} OUTBOUND_FREEDOM direct relay", .{pfx.str()});
             const target_adapter = StreamAdapter.from(TcpStream, &target_tcp);
             const result = if (initial_payload.len > 0)
                 relay_mod.doRelayAdaptedWithFirstPacket(client_adapter.*, target_adapter, initial_payload, shard, cfg)
@@ -986,30 +826,27 @@ fn doOutboundAndRelay(
         .trojan => {
             switch (outbound.proto) {
                 .trojan => |*t| {
-                    logger.access("{s} OUTBOUND_TROJAN encoding handshake", .{pfx.str()});
                     var hdr_buf: [512]u8 = undefined;
                     const hdr_len = t.encodeHandshake(effective, .connect, &hdr_buf) orelse {
                         shard.onError();
                         ctx.setError(.protocol_encode_failed);
-                        logger.connError("{s} OUTBOUND_TROJAN_ENCODE_FAILED", .{pfx.str()});
+                        logger.connError("{s} ERROR trojan_out encode", .{pfx.str()});
                         return;
                     };
-                    logger.access("{s} OUTBOUND_TROJAN handshake={d}bytes, sending", .{ pfx.str(), hdr_len });
                     target_tcp.writeAll(hdr_buf[0..hdr_len]) catch |err| {
                         shard.onError();
                         ctx.setError(.outbound_connection_failed);
-                        logger.connError("{s} OUTBOUND_TROJAN_WRITE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR trojan_out write {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
                     if (initial_payload.len > 0) {
                         target_tcp.writeAll(initial_payload) catch |err| {
                             shard.onError();
                             ctx.setError(.outbound_connection_failed);
-                            logger.connError("{s} OUTBOUND_TROJAN_PAYLOAD_WRITE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                            logger.connError("{s} ERROR trojan_out payload {s}", .{ pfx.str(), @errorName(err) });
                             return;
                         };
                     }
-                    logger.access("{s} OUTBOUND_TROJAN_HANDSHAKE_OK, relay starting", .{pfx.str()});
                     const target_adapter = StreamAdapter.from(TcpStream, &target_tcp);
                     const result = relay_mod.doRelayAdapted(client_adapter.*, target_adapter, shard, cfg);
                     var r = result;
@@ -1017,45 +854,36 @@ fn doOutboundAndRelay(
                     recordTrafficAndLog(ctx, runtime, r, logger, pfx);
                 },
                 else => {
-                    logger.connError("{s} OUTBOUND_PROTO_MISMATCH expected=trojan got={s}", .{ pfx.str(), @tagName(outbound.proto) });
                     shard.onError();
-                    return;
+                    logger.connError("{s} ERROR proto_mismatch expected=trojan", .{pfx.str()});
                 },
             }
         },
         .vmess => {
             switch (outbound.proto) {
                 .vmess => |*v| {
-                    logger.access("{s} OUTBOUND_VMESS encoding handshake", .{pfx.str()});
                     const hs = v.encodeHandshake(effective, .tcp) catch |err| {
                         shard.onError();
                         ctx.setError(.protocol_encode_failed);
-                        logger.connError("{s} OUTBOUND_VMESS_ENCODE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR vmess_out encode {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
-                    logger.access("{s} OUTBOUND_VMESS handshake={d}bytes, sending", .{ pfx.str(), hs.data_len });
                     target_tcp.writeAll(hs.data[0..hs.data_len]) catch |err| {
                         shard.onError();
                         ctx.setError(.outbound_connection_failed);
-                        logger.connError("{s} OUTBOUND_VMESS_WRITE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR vmess_out write {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
-                    logger.access("{s} OUTBOUND_VMESS reading response", .{pfx.str()});
                     vmess_outbound.VMessOutbound.readResponse(
-                        TcpStream,
-                        &target_tcp,
-                        &hs.response_key,
-                        &hs.response_iv,
-                        hs.response_header,
+                        TcpStream, &target_tcp,
+                        &hs.response_key, &hs.response_iv, hs.response_header,
                     ) catch |err| {
                         shard.onError();
                         ctx.setError(.vmess_invalid_response);
-                        logger.connError("{s} OUTBOUND_VMESS_RESPONSE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR vmess_out response {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
-                    logger.access("{s} OUTBOUND_VMESS_HANDSHAKE_OK security={s}", .{ pfx.str(), @tagName(hs.security) });
                     const cipher = hs.security.toAeadCipher() orelse {
-                        logger.access("{s} OUTBOUND_VMESS security=none/zero (raw relay)", .{pfx.str()});
                         const target_adapter = StreamAdapter.from(TcpStream, &target_tcp);
                         const result = if (initial_payload.len > 0)
                             relay_mod.doRelayAdaptedWithFirstPacket(client_adapter.*, target_adapter, initial_payload, shard, cfg)
@@ -1067,49 +895,42 @@ fn doOutboundAndRelay(
                     var vmess_target = vmess_stream_mod.VMessStream(TcpStream).init(
                         target_tcp, cipher,
                         hs.response_key, hs.response_iv,
-                        hs.request_key, hs.request_iv,
-                        hs.options,
+                        hs.request_key, hs.request_iv, hs.options,
                     );
                     if (initial_payload.len > 0) {
                         vmess_target.writeAll(initial_payload) catch |err| {
                             shard.onError();
                             ctx.setError(.outbound_connection_failed);
-                            logger.connError("{s} OUTBOUND_VMESS_PAYLOAD_WRITE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                            logger.connError("{s} ERROR vmess_out payload {s}", .{ pfx.str(), @errorName(err) });
                             return;
                         };
                     }
-                    logger.access("{s} OUTBOUND_VMESS_RELAY_START cipher={s}", .{ pfx.str(), @tagName(cipher) });
-                    const target_adapter = StreamAdapter.from(
-                        vmess_stream_mod.VMessStream(TcpStream),
-                        &vmess_target,
-                    );
+                    const target_adapter = StreamAdapter.from(vmess_stream_mod.VMessStream(TcpStream), &vmess_target);
                     const result = relay_mod.doRelayAdapted(client_adapter.*, target_adapter, shard, cfg);
                     var r = result;
                     r.bytes_up += initial_payload.len;
                     recordTrafficAndLog(ctx, runtime, r, logger, pfx);
                 },
                 else => {
-                    logger.connError("{s} OUTBOUND_PROTO_MISMATCH expected=vmess got={s}", .{ pfx.str(), @tagName(outbound.proto) });
                     shard.onError();
-                    return;
+                    logger.connError("{s} ERROR proto_mismatch expected=vmess", .{pfx.str()});
                 },
             }
         },
         .shadowsocks => {
             switch (outbound.proto) {
                 .ss => |*s| {
-                    logger.access("{s} OUTBOUND_SS generating keys", .{pfx.str()});
                     const write_keys = s.generateWriteKeys() catch |err| {
                         shard.onError();
                         ctx.setError(.protocol_encode_failed);
-                        logger.connError("{s} OUTBOUND_SS_KEY_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR ss_out keygen {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
                     var addr_buf: [256]u8 = undefined;
                     const addr_len = ss_outbound.SsOutbound.encodeAddress(effective, &addr_buf) orelse {
                         shard.onError();
                         ctx.setError(.protocol_encode_failed);
-                        logger.connError("{s} OUTBOUND_SS_ADDR_ENCODE_FAILED", .{pfx.str()});
+                        logger.connError("{s} ERROR ss_out addr_encode", .{pfx.str()});
                         return;
                     };
                     var first_buf: [4096 + 256]u8 = undefined;
@@ -1119,12 +940,8 @@ fn doOutboundAndRelay(
                         @memcpy(first_buf[addr_len..][0..initial_payload.len], initial_payload);
                         first_len += initial_payload.len;
                     }
-                    logger.access("{s} OUTBOUND_SS writing first chunk addr={d}bytes+payload={d}bytes", .{
-                        pfx.str(), addr_len, initial_payload.len,
-                    });
                     var ss_target = ss_stream_mod.SsStream(TcpStream).init(
-                        target_tcp,
-                        s.cipher_info.cipher_type,
+                        target_tcp, s.cipher_info.cipher_type,
                         write_keys.subkey[0..write_keys.subkey_len],
                         write_keys.subkey[0..write_keys.subkey_len],
                         write_keys.salt[0..write_keys.salt_len],
@@ -1132,23 +949,18 @@ fn doOutboundAndRelay(
                     ss_target.writeAll(first_buf[0..first_len]) catch |err| {
                         shard.onError();
                         ctx.setError(.outbound_connection_failed);
-                        logger.connError("{s} OUTBOUND_SS_WRITE_FAILED err={s}", .{ pfx.str(), @errorName(err) });
+                        logger.connError("{s} ERROR ss_out write {s}", .{ pfx.str(), @errorName(err) });
                         return;
                     };
-                    logger.access("{s} OUTBOUND_SS_RELAY_START cipher={s}", .{ pfx.str(), @tagName(s.cipher_info.cipher_type) });
-                    const target_adapter = StreamAdapter.from(
-                        ss_stream_mod.SsStream(TcpStream),
-                        &ss_target,
-                    );
+                    const target_adapter = StreamAdapter.from(ss_stream_mod.SsStream(TcpStream), &ss_target);
                     const result = relay_mod.doRelayAdapted(client_adapter.*, target_adapter, shard, cfg);
                     var r = result;
                     r.bytes_up += initial_payload.len;
                     recordTrafficAndLog(ctx, runtime, r, logger, pfx);
                 },
                 else => {
-                    logger.connError("{s} OUTBOUND_PROTO_MISMATCH expected=ss got={s}", .{ pfx.str(), @tagName(outbound.proto) });
                     shard.onError();
-                    return;
+                    logger.connError("{s} ERROR proto_mismatch expected=ss", .{pfx.str()});
                 },
             }
         },
@@ -1175,35 +987,22 @@ fn recordTrafficAndLog(
     const down_str = types.formatBytes(result.bytes_down, &down_buf);
     const total_ms = ctx.durationMs();
     const effective = ctx.effectiveTarget();
-
-    // 各阶段耗时
-    const auth_ms = stageDurationMs(ctx.accept_time_us, ctx.handshake_done_us);
-    const sniff_ms = stageDurationMs(ctx.handshake_done_us, ctx.sniff_done_us);
-    const dial_ms = stageDurationMs(ctx.sniff_done_us, ctx.dial_done_us);
     const relay_ms = stageDurationMs(ctx.dial_done_us, ctx.close_time_us);
 
-    const status: []const u8 = if (result.err == null) "ok" else "err";
-    const err_name: []const u8 = if (result.err) |e| @errorName(e) else "-";
-
-    logger.access("{s} CLOSED {s}:{s}:{d} [{s}->{s}] user={d} email={s} {s} up={s} down={s} total={d}ms auth={d}ms sniff={d}ms dial={d}ms relay={d}ms relay_err={s}", .{
-        pfx.str(),
-        @tagName(ctx.network),
-        effective.host(),
-        effective.port,
-        ctx.inboundTag(),
-        ctx.outboundTag(),
-        ctx.user_id,
-        if (ctx.user_email_len > 0) ctx.userEmail() else "-",
-        status,
-        up_str,
-        down_str,
-        total_ms,
-        auth_ms,
-        sniff_ms,
-        dial_ms,
-        relay_ms,
-        err_name,
-    });
+    // CLOSE: 一行完整连接摘要
+    // 格式: [ip:port][conn][tag] CLOSE target:port via=outbound up=X down=Y Tms (relay Rms) [err]
+    if (result.err) |e| {
+        logger.access("{s} CLOSE {s}:{d} via={s} up={s} down={s} {d}ms relay={d}ms err={s}", .{
+            pfx.str(), effective.host(), effective.port,
+            ctx.outboundTag(), up_str, down_str,
+            total_ms, relay_ms, @errorName(e),
+        });
+    } else {
+        logger.access("{s} CLOSE {s}:{d} via={s} up={s} down={s} {d}ms", .{
+            pfx.str(), effective.host(), effective.port,
+            ctx.outboundTag(), up_str, down_str, total_ms,
+        });
+    }
 }
 
 fn relayConfig(ctx: *const session_mod.SessionContext, runtime: *const Runtime) relay_mod.RelayConfig {
