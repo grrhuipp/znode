@@ -102,5 +102,6 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "chore: rebuild aws-lc static libs (musl + gnu, zig cc)"
+            git pull --rebase
             git push
           fi
