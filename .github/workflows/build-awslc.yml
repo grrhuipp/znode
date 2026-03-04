@@ -31,41 +31,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
 
       - name: Clone aws-lc
-        run: git clone --depth 1 --branch main https://github.com/aws/aws-lc.git /tmp/aws-lc-src
+        run: |
+          git clone --depth 1 --branch main https://github.com/aws/aws-lc.git /tmp/aws-lc-src
+          # Remove flags unsupported by zig cc
+          sed -i 's/-Wp,-U_FORTIFY_SOURCE//g' /tmp/aws-lc-src/third_party/jitterentropy/CMakeLists.txt
 
       - name: Build aws-lc (${{ matrix.target }})
         env:
           ZIG_TARGET: ${{ matrix.target }}
         run: |
           mkdir -p /tmp/zigcc
-          cat > /tmp/zigcc/zigcc <<'ZIGCC'
-          #!/bin/bash
-          args=()
-          skip=false
-          for a in "$@"; do
-            if $skip; then skip=false; continue; fi
-            case "$a" in
-              -Wp,*|-fsanitize*) ;;
-              --param) skip=true ;;
-              *) args+=("$a") ;;
-            esac
-          done
-          exec zig cc -target $ZIG_TARGET "${args[@]}"
-          ZIGCC
-          cat > /tmp/zigcc/zigcxx <<'ZIGCXX'
-          #!/bin/bash
-          args=()
-          skip=false
-          for a in "$@"; do
-            if $skip; then skip=false; continue; fi
-            case "$a" in
-              -Wp,*|-fsanitize*) ;;
-              --param) skip=true ;;
-              *) args+=("$a") ;;
-            esac
-          done
-          exec zig c++ -target $ZIG_TARGET "${args[@]}"
-          ZIGCXX
+          printf '#!/bin/bash\nexec zig cc -target %s "$@"\n' "$ZIG_TARGET" > /tmp/zigcc/zigcc
+          printf '#!/bin/bash\nexec zig c++ -target %s "$@"\n' "$ZIG_TARGET" > /tmp/zigcc/zigcxx
           chmod +x /tmp/zigcc/zigcc /tmp/zigcc/zigcxx
 
           mkdir -p /tmp/aws-lc-build
