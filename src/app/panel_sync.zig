@@ -468,7 +468,15 @@ fn fetchUsers(
 
     const response = try httpGet(allocator, panel.api_host, path, panel.api_key);
 
-    // Parse JSON response: {"users": [{...}, ...]}
+    // 调试: 打印响应状态和前 512 字节
+    const preview_len = @min(response.body.len, 512);
+    std.log.info("面板用户API: node={d} status={d} body_len={d} body={s}", .{
+        node_id,
+        response.status,
+        response.body.len,
+        response.body[0..preview_len],
+    });
+
     return parseUsersJson(allocator, response.body);
 }
 
@@ -477,21 +485,40 @@ fn parseUsersJson(allocator: std.mem.Allocator, body: []const u8) ![]PanelUser {
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
         .allocate = .alloc_always,
-    }) catch return &.{};
-
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return &.{},
+    }) catch |err| {
+        std.log.warn("面板用户JSON解析失败: err={s}", .{@errorName(err)});
+        return &.{};
     };
 
-    const users_val = root.get("users") orelse return &.{};
-    const users_arr = switch (users_val) {
-        .array => |a| a,
+    // 支持多种 V2Board API 响应格式:
+    // 1. 直接数组: [{...}, ...]
+    // 2. {"data": [{...}, ...]}
+    // 3. {"users": [{...}, ...]}
+    const users_items: []const std.json.Value = switch (parsed.value) {
+        .array => |a| a.items, // 格式 1: 直接数组
+        .object => |o| blk: {
+            // 格式 2/3: 尝试 "data" 和 "users" 两个 key
+            const val = o.get("data") orelse o.get("users") orelse {
+                std.log.warn("面板用户JSON: 无 data/users key", .{});
+                var key_iter = o.iterator();
+                while (key_iter.next()) |entry| {
+                    std.log.warn("  available key: {s}", .{entry.key_ptr.*});
+                }
+                break :blk &[_]std.json.Value{};
+            };
+            break :blk switch (val) {
+                .array => |a| a.items,
+                else => {
+                    std.log.warn("面板用户JSON: data/users 值不是数组", .{});
+                    break :blk &[_]std.json.Value{};
+                },
+            };
+        },
         else => return &.{},
     };
 
     var list = std.array_list.Managed(PanelUser).init(allocator);
-    for (users_arr.items) |item| {
+    for (users_items) |item| {
         const obj = switch (item) {
             .object => |o| o,
             else => continue,

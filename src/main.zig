@@ -147,11 +147,18 @@ pub fn main() !void {
     var rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(@intCast(cfg.workers)),
     });
-    defer rt.deinit();
+    // 注意: 不 defer rt.deinit() — 服务器永久运行，
+    // 异常退出时 detached fibers 仍在运行，deinit 会导致 allocator crash。
+    // OS 进程退出时自动回收所有资源。
 
     // Run server inside a zio fiber (all I/O must be fiber-context)
     var handle = try rt.spawn(server.run, .{ arena, &cfg });
-    try handle.join();
+    handle.join() catch |err| {
+        std.log.err("server.run 异常退出: {s}", .{@errorName(err)});
+    };
+
+    // 正常情况下不应到达这里（listener fibers 永久运行）
+    std.log.err("server.run 意外返回，程序即将退出", .{});
 }
 
 fn printHelp() void {
