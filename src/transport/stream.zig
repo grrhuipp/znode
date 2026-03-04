@@ -9,6 +9,7 @@ const SslContext = @import("tls/context.zig").SslContext;
 /// expected by TlsStream, WsStream, VMessStream, SsStream.
 pub const TcpStream = struct {
     inner: zio.net.Stream,
+    closed: bool = false,
 
     pub fn init(stream: zio.net.Stream) TcpStream {
         return .{ .inner = stream };
@@ -26,8 +27,12 @@ pub const TcpStream = struct {
         return self.inner.writeAll(data, .none);
     }
 
+    /// 幂等 close：relay closeBoth + defer close 不会双重关闭
     pub fn close(self: *TcpStream) void {
-        self.inner.close();
+        if (!self.closed) {
+            self.closed = true;
+            self.inner.close();
+        }
     }
 };
 
