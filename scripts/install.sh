@@ -3,6 +3,9 @@ set -euo pipefail
 
 # znode 一键安装/更新脚本
 # 用法: curl -fsSL https://raw.githubusercontent.com/grrhuipp/znode/main/scripts/install.sh | bash
+# 参数: [版本] [变体]
+#   版本: autobuild (默认), v1.0.0, ...
+#   变体: safe (默认,带符号), fast, debug, small
 
 REPO="grrhuipp/znode"
 INSTALL_DIR="/usr/local/bin"
@@ -33,7 +36,8 @@ detect_arch() {
 install_binary() {
     local version=$1
     local arch=$2
-    local artifact="znode-linux-${arch}-fast"
+    local variant=$3
+    local artifact="znode-linux-${arch}-${variant}"
     local url="https://github.com/${REPO}/releases/download/${version}/${artifact}.tar.gz"
 
     info "下载 ${version} (${arch})..."
@@ -131,7 +135,8 @@ main() {
     arch=$(detect_arch)
 
     local version="${1:-autobuild}"
-    info "目标版本: ${version}"
+    local variant="${2:-safe}"
+    info "目标版本: ${version} (${variant})"
 
     # 检查是否已安装相同版本
     if command -v znode &>/dev/null; then
@@ -146,7 +151,7 @@ main() {
         sudo systemctl stop "$SERVICE_NAME"
     fi
 
-    install_binary "$version" "$arch"
+    install_binary "$version" "$arch" "$variant"
     setup_config
     setup_service
 
