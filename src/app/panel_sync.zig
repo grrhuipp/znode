@@ -73,6 +73,20 @@ pub const TrafficTracker = struct {
     }
 };
 
+// ── Node config from V2Board API ─────────────────────────────────────────
+
+pub const NodeConfig = struct {
+    server_port: u16 = 0,
+    network: []const u8 = "tcp",
+    ws_path: []const u8 = "/",
+    ws_host: []const u8 = "",
+    tls_enabled: bool = false,
+    server_name: []const u8 = "",
+    cipher: []const u8 = "",
+    pull_interval: u32 = 60,
+    push_interval: u32 = 60,
+};
+
 // ── Panel user ───────────────────────────────────────────────────────────
 
 pub const PanelUser = struct {
@@ -99,6 +113,109 @@ pub const PanelSyncManager = struct {
             .panels = panels,
             .tracker = tracker,
         };
+    }
+
+    /// Initial sync: fetch node configs + users from all panels.
+    /// Returns dynamically generated InboundConfig entries.
+    /// Called at startup before building inbounds.
+    pub fn initialSync(self: *PanelSyncManager) ![]config.InboundConfig {
+        var inbounds = std.array_list.Managed(config.InboundConfig).init(self.allocator);
+
+        for (self.panels) |*panel| {
+            if (panel.api_host.len == 0 or panel.api_key.len == 0) continue;
+            if (panel.node_ids.len == 0) continue;
+
+            for (panel.node_ids) |node_id| {
+                self.syncOneNode(self.allocator, panel, node_id, &inbounds) catch |err| {
+                    std.log.warn("面板节点同步失败: name={s} node={d} err={s}", .{
+                        panel.name,
+                        node_id,
+                        @errorName(err),
+                    });
+                    continue;
+                };
+            }
+        }
+
+        return try inbounds.toOwnedSlice();
+    }
+
+    fn syncOneNode(
+        self: *PanelSyncManager,
+        allocator: std.mem.Allocator,
+        panel: *const config.PanelConfig,
+        node_id: i64,
+        inbounds: *std.array_list.Managed(config.InboundConfig),
+    ) !void {
+        _ = self;
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // 1. Fetch node config (port, network, TLS, cipher)
+        const node_cfg = try fetchNodeConfig(arena, panel, node_id);
+        if (node_cfg.server_port == 0) {
+            std.log.warn("面板节点端口为0: name={s} node={d}", .{ panel.name, node_id });
+            return;
+        }
+
+        // 2. Fetch users
+        const users = try fetchUsers(arena, panel, node_id);
+        std.log.info("面板同步: name={s} node={d} port={d} protocol={s} users={d}", .{
+            panel.name,
+            node_id,
+            node_cfg.server_port,
+            panel.node_type,
+            users.len,
+        });
+
+        // 3. Convert panel users → ClientConfig
+        var clients = std.array_list.Managed(config.ClientConfig).init(allocator);
+        for (users) |pu| {
+            try clients.append(.{
+                .password = try dupStr(allocator, pu.uuid),
+                .email = try dupStr(allocator, pu.email),
+                .user_id = pu.user_id,
+                .speed_limit_mbps = pu.speed_limit_mbps,
+            });
+        }
+
+        // 4. Build tag: {panel_name}-{protocol}-{node_id}
+        const tag = try std.fmt.allocPrint(allocator, "{s}-{s}-{d}", .{
+            panel.name,
+            panel.node_type,
+            node_id,
+        });
+
+        // 5. Build stream settings from node config
+        var stream_settings = config.StreamSettings{};
+        if (node_cfg.tls_enabled) {
+            stream_settings.security = "tls";
+            stream_settings.tls = .{
+                .cert_file = if (panel.tls_cert.len > 0) panel.tls_cert else "",
+                .key_file = if (panel.tls_key.len > 0) panel.tls_key else "",
+                .server_name = node_cfg.server_name,
+            };
+        }
+        if (std.ascii.eqlIgnoreCase(node_cfg.network, "ws")) {
+            stream_settings.network = "ws";
+            stream_settings.ws = .{
+                .path = if (node_cfg.ws_path.len > 0) node_cfg.ws_path else "/",
+            };
+        }
+
+        // 6. Build InboundConfig
+        try inbounds.append(.{
+            .tag = tag,
+            .protocol = try dupStr(allocator, panel.node_type),
+            .listen = try dupStr(allocator, "0.0.0.0"),
+            .port = node_cfg.server_port,
+            .outbound_tag = null,
+            .clients = try clients.toOwnedSlice(),
+            .stream_settings = stream_settings,
+            .sniff = .{ .enabled = true, .override_dest = true },
+        });
     }
 
     /// Start background sync threads (one per panel).
@@ -218,7 +335,114 @@ pub const PanelSyncManager = struct {
     }
 };
 
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+fn dupStr(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const copy = try allocator.alloc(u8, s.len);
+    @memcpy(copy, s);
+    return copy;
+}
+
+fn valueToInt(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |n| n,
+        .float => |f| if (f >= -9.2e18 and f <= 9.2e18) @as(i64, @intFromFloat(f)) else null,
+        else => null,
+    };
+}
+
 // ── V2Board API ──────────────────────────────────────────────────────────
+
+fn fetchNodeConfig(
+    allocator: std.mem.Allocator,
+    panel: *const config.PanelConfig,
+    node_id: i64,
+) !NodeConfig {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "/api/v1/server/UniProxy/config?node_id={d}&node_type={s}&token={s}",
+        .{ node_id, panel.node_type, panel.api_key },
+    );
+
+    const response = try httpGet(allocator, panel.api_host, path, panel.api_key);
+    return parseNodeConfigJson(allocator, response.body);
+}
+
+fn parseNodeConfigJson(allocator: std.mem.Allocator, body: []const u8) NodeConfig {
+    if (body.len == 0) return .{};
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+        .allocate = .alloc_always,
+    }) catch return .{};
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+
+    var cfg = NodeConfig{};
+
+    // server_port
+    if (root.get("server_port")) |v| {
+        if (valueToInt(v)) |n| {
+            if (n > 0 and n <= 65535) cfg.server_port = @intCast(n);
+        }
+    }
+
+    // network
+    if (root.get("network")) |v| {
+        if (v == .string) cfg.network = v.string;
+    }
+
+    // networkSettings: {path, headers: {Host}}
+    if (root.get("networkSettings")) |v| {
+        if (v == .object) {
+            if (v.object.get("path")) |pv| {
+                if (pv == .string) cfg.ws_path = pv.string;
+            }
+            if (v.object.get("headers")) |hv| {
+                if (hv == .object) {
+                    if (hv.object.get("Host")) |host| {
+                        if (host == .string) cfg.ws_host = host.string;
+                    }
+                }
+            }
+        }
+    }
+
+    // tls: 0/1 or bool
+    if (root.get("tls")) |v| {
+        switch (v) {
+            .integer => |n| cfg.tls_enabled = n != 0,
+            .bool => |b| cfg.tls_enabled = b,
+            else => {},
+        }
+    }
+
+    // server_name
+    if (root.get("server_name")) |v| {
+        if (v == .string) cfg.server_name = v.string;
+    }
+
+    // cipher (Shadowsocks)
+    if (root.get("cipher")) |v| {
+        if (v == .string) cfg.cipher = v.string;
+    }
+
+    // base_config: {pull_interval, push_interval}
+    if (root.get("base_config")) |v| {
+        if (v == .object) {
+            if (v.object.get("pull_interval")) |pi| {
+                if (valueToInt(pi)) |n| cfg.pull_interval = @intCast(n);
+            }
+            if (v.object.get("push_interval")) |pi| {
+                if (valueToInt(pi)) |n| cfg.push_interval = @intCast(n);
+            }
+        }
+    }
+
+    return cfg;
+}
 
 fn fetchUsers(
     allocator: std.mem.Allocator,

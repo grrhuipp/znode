@@ -103,24 +103,43 @@ pub fn run(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     });
     defer runtime.pool.deinit();
 
-    const inbounds = try buildInbounds(allocator, cfg.inbounds);
-    if (inbounds.len == 0) {
-        return config.ConfigError.InvalidConfig;
+    const logger = log.getLogger();
+
+    // Merge static inbounds with panel-generated inbounds
+    var all_inbound_cfgs = std.array_list.Managed(config.InboundConfig).init(allocator);
+    for (cfg.inbounds) |item| {
+        try all_inbound_cfgs.append(item);
     }
+
+    // Panel initial sync: fetch node configs + users → generate inbounds
+    if (cfg.panels.len > 0) {
+        var sync = panel_sync.PanelSyncManager.init(allocator, cfg.panels, &runtime.tracker);
+        const panel_inbounds = sync.initialSync() catch |err| blk: {
+            logger.console("面板初始同步失败: {s}", .{@errorName(err)});
+            break :blk &[_]config.InboundConfig{};
+        };
+        for (panel_inbounds) |item| {
+            try all_inbound_cfgs.append(item);
+        }
+        // Start background sync loop for periodic user/traffic updates
+        sync.start();
+    }
+
+    const inbounds = try buildInbounds(allocator, try all_inbound_cfgs.toOwnedSlice());
 
     const stats_thread = try std.Thread.spawn(.{}, statsLoop, .{&runtime});
     stats_thread.detach();
 
-    // Start panel sync if configured
-    if (cfg.panels.len > 0) {
-        var sync = panel_sync.PanelSyncManager.init(allocator, cfg.panels, &runtime.tracker);
-        sync.start();
+    if (inbounds.len == 0) {
+        logger.console("没有 inbound 监听器，等待面板同步...", .{});
+        // Block forever — panel sync runs in background
+        while (true) {
+            std.Thread.sleep(60 * std.time.ns_per_s);
+        }
     }
 
     var listener_threads = try allocator.alloc(std.Thread, inbounds.len);
     var listener_count: usize = 0;
-
-    const logger = log.getLogger();
 
     for (inbounds) |*inbound| {
         if (inbound.protocol == .unsupported) continue;
@@ -139,7 +158,10 @@ pub fn run(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     }
 
     if (listener_count == 0) {
-        return config.ConfigError.InvalidConfig;
+        logger.console("没有可用的 inbound 监听器", .{});
+        while (true) {
+            std.Thread.sleep(60 * std.time.ns_per_s);
+        }
     }
 
     for (listener_threads[0..listener_count]) |thread| {
