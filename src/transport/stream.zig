@@ -1,30 +1,34 @@
 const std = @import("std");
+const zio = @import("zio");
 const TlsStream = @import("tls/stream.zig").TlsStream;
 const ws = @import("ws/stream.zig");
 const SslContext = @import("tls/context.zig").SslContext;
 
-/// Placeholder for the actual zio TCP stream type.
-/// Will be replaced with zio.net.Stream when integrating with zio.
+/// Thin wrapper around zio.net.Stream that hides the Timeout parameter.
+/// Provides read/write/writeAll/close matching the Inner type contract
+/// expected by TlsStream, WsStream, VMessStream, SsStream.
 pub const TcpStream = struct {
-    fd: i32 = -1,
+    inner: zio.net.Stream,
+
+    pub fn init(stream: zio.net.Stream) TcpStream {
+        return .{ .inner = stream };
+    }
 
     pub fn read(self: *TcpStream, buf: []u8) !usize {
-        _ = self;
-        _ = buf;
-        return error.NotImplemented;
+        return self.inner.read(buf, .none);
     }
 
     pub fn write(self: *TcpStream, data: []const u8) !usize {
-        _ = self;
-        _ = data;
-        return error.NotImplemented;
+        return self.inner.write(data, .none);
+    }
+
+    pub fn writeAll(self: *TcpStream, data: []const u8) !void {
+        return self.inner.writeAll(data, .none);
     }
 
     pub fn close(self: *TcpStream) void {
-        _ = self;
+        self.inner.close();
     }
-
-    const NotImplemented = error{NotImplemented};
 };
 
 /// Transport layer stream — comptime-composed layers, runtime-switched via tagged union.

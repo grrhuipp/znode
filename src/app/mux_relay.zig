@@ -5,12 +5,13 @@
 const std = @import("std");
 const types = @import("../common/types.zig");
 const mux_codec = @import("../protocol/mux/codec.zig");
+const TcpStream = @import("../transport/stream.zig").TcpStream;
 
 /// Per-TCP sub-session state.
 const TcpSub = struct {
     session_id: u16,
     target: types.TargetAddress,
-    outbound_stream: ?std.net.Stream = null,
+    outbound_stream: ?TcpStream = null,
     closed: bool = false,
 };
 

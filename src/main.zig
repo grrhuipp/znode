@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const config = @import("infra/config.zig");
 const server = @import("app/handler.zig");
 
@@ -142,7 +143,15 @@ pub fn main() !void {
         log_dir,
     });
 
-    try server.run(arena, &cfg);
+    // Initialize zio runtime — fiber-per-connection event loop
+    var rt = try zio.Runtime.init(gpa, .{
+        .executors = .exact(@intCast(cfg.workers)),
+    });
+    defer rt.deinit();
+
+    // Run server inside a zio fiber (all I/O must be fiber-context)
+    var handle = try rt.spawn(server.run, .{ arena, &cfg });
+    try handle.join();
 }
 
 fn printHelp() void {

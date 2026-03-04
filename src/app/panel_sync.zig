@@ -5,10 +5,12 @@
 ///   2. Collect per-user traffic → POST to panel API
 ///   3. Report online users → POST to panel API
 const std = @import("std");
+const zio = @import("zio");
 const config = @import("../infra/config.zig");
 const types = @import("../common/types.zig");
 const tls_ctx_mod = @import("../transport/tls/context.zig");
 const tls_stream_mod = @import("../transport/tls/stream.zig");
+const TcpStream = @import("../transport/stream.zig").TcpStream;
 
 // Protocol user managers
 const trojan_um = @import("../protocol/trojan/user_manager.zig");
@@ -224,14 +226,14 @@ pub const PanelSyncManager = struct {
             if (panel.api_host.len == 0 or panel.api_key.len == 0) continue;
             if (panel.node_ids.len == 0) continue;
 
-            const thread = std.Thread.spawn(.{}, panelSyncLoop, .{ self, panel }) catch |err| {
-                std.log.err("面板同步线程启动失败: name={s} err={s}", .{
+            var handle = zio.spawn(panelSyncLoop, .{ self, panel }) catch |err| {
+                std.log.err("面板同步 fiber 启动失败: name={s} err={s}", .{
                     panel.name,
                     @errorName(err),
                 });
                 continue;
             };
-            thread.detach();
+            handle.detach();
             std.log.info("面板同步启动: name={s} nodes={d}", .{
                 panel.name,
                 panel.node_ids.len,
@@ -241,7 +243,7 @@ pub const PanelSyncManager = struct {
 
     fn panelSyncLoop(self: *PanelSyncManager, panel: *const config.PanelConfig) void {
         // Initial delay
-        std.Thread.sleep(5 * std.time.ns_per_s);
+        zio.sleep(zio.time.Duration.fromSeconds(5)) catch return;
 
         while (true) {
             for (panel.node_ids) |node_id| {
@@ -262,7 +264,7 @@ pub const PanelSyncManager = struct {
                 });
             };
 
-            std.Thread.sleep(60 * std.time.ns_per_s);
+            zio.sleep(zio.time.Duration.fromSeconds(60)) catch return;
         }
     }
 
@@ -756,30 +758,30 @@ fn sendRequest(
     request_data: []const u8,
 ) !HttpResponse {
     // TCP connect
-    const tcp_stream = try std.net.tcpConnectToHost(allocator, url_info.host, url_info.port);
+    const raw = try zio.net.tcpConnectToHost(url_info.host, url_info.port, .{});
+    var tcp_stream = TcpStream.init(raw);
 
     if (url_info.is_https) {
-        return sendRequestTls(allocator, tcp_stream, url_info.host, request_data);
+        return sendRequestTls(allocator, &tcp_stream, url_info.host, request_data);
     } else {
-        return sendRequestPlain(allocator, tcp_stream, request_data);
+        return sendRequestPlain(allocator, &tcp_stream, request_data);
     }
 }
 
 fn sendRequestPlain(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: *TcpStream,
     request_data: []const u8,
 ) !HttpResponse {
-    var s = stream;
-    defer s.close();
+    defer stream.close();
 
-    s.writeAll(request_data) catch return error.NetworkError;
-    return readHttpResponse(allocator, &s);
+    stream.writeAll(request_data) catch return error.NetworkError;
+    return readHttpResponse(allocator, stream);
 }
 
 fn sendRequestTls(
     allocator: std.mem.Allocator,
-    tcp_stream: std.net.Stream,
+    tcp_stream: *TcpStream,
     host: []const u8,
     request_data: []const u8,
 ) !HttpResponse {
@@ -787,8 +789,8 @@ fn sendRequestTls(
         return error.NetworkError;
     defer ssl_ctx.deinit();
 
-    var tls = tls_stream_mod.TlsStream(std.net.Stream).init(
-        tcp_stream,
+    var tls = tls_stream_mod.TlsStream(TcpStream).init(
+        tcp_stream.*,
         &ssl_ctx,
         false,
     ) catch return error.NetworkError;
@@ -814,7 +816,7 @@ fn sendRequestTls(
 
 fn readHttpResponse(
     allocator: std.mem.Allocator,
-    stream: *std.net.Stream,
+    stream: *TcpStream,
 ) !HttpResponse {
     var buf = std.array_list.Managed(u8).init(allocator);
     var tmp: [4096]u8 = undefined;
@@ -830,7 +832,7 @@ fn readHttpResponse(
 
 fn readHttpResponseTls(
     allocator: std.mem.Allocator,
-    tls: *tls_stream_mod.TlsStream(std.net.Stream),
+    tls: *tls_stream_mod.TlsStream(TcpStream),
 ) !HttpResponse {
     var buf = std.array_list.Managed(u8).init(allocator);
     var tmp: [4096]u8 = undefined;

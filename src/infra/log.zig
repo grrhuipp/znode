@@ -55,6 +55,7 @@ const Channel = struct {
         pos = appendFmt(&buf, pos, " [{s}] ", .{level.string()});
         pos = appendFmt(&buf, pos, fmt ++ "\n", args);
         f.writeAll(buf[0..pos]) catch {};
+        f.sync() catch {}; // 立即 flush，确保 tail -f 实时可见
     }
 
     /// 无 level 前缀写入（access.log / error.log 用）。
@@ -68,6 +69,7 @@ const Channel = struct {
         pos = appendTimestamp(&buf, pos);
         pos = appendFmt(&buf, pos, " " ++ fmt ++ "\n", args);
         f.writeAll(buf[0..pos]) catch {};
+        f.sync() catch {}; // 立即 flush，确保 tail -f 实时可见
     }
 };
 
