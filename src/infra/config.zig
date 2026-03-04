@@ -54,7 +54,7 @@ pub const SniffConfig = struct {
 
 pub const LogConfig = struct {
     level: []const u8 = "info",
-    log_dir: []const u8 = "/var/log/znode",
+    log_dir: []const u8 = "log",
     max_days: u16 = 15,
 };
 
@@ -622,7 +622,7 @@ fn parseSniffConfig(obj: std.json.ObjectMap) SniffConfig {
 fn parseLogConfig(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !LogConfig {
     return LogConfig{
         .level = try dupString(allocator, getFieldString(obj, &.{ "level", "Level" }) orelse "info"),
-        .log_dir = try dupString(allocator, getFieldString(obj, &.{ "logDir", "LogDir", "log_dir" }) orelse "/var/log/znode"),
+        .log_dir = try dupString(allocator, getFieldString(obj, &.{ "logDir", "LogDir", "log_dir" }) orelse "log"),
         .max_days = @intCast(@max(getFieldInt(obj, &.{ "maxDays", "MaxDays", "max_days" }) orelse 15, 0)),
     };
 }

@@ -78,6 +78,8 @@ pub const outbound = struct {
     pub const registry = @import("outbound/registry.zig");
 };
 
+const log = @import("infra/log.zig");
+
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -92,11 +94,11 @@ pub fn main() !void {
 
     _ = args.next();
 
-    // 默认加载二进制所在目录下的 config/
+    // 默认基础目录 = 二进制所在目录
     var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = std.fs.selfExePath(&exe_dir_buf) catch "znode";
     const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
-    var config_path = try std.fs.path.join(arena, &.{ exe_dir, "config" });
+    var base_dir: []const u8 = exe_dir;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -105,7 +107,7 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--dir")) {
             if (args.next()) |v| {
-                config_path = try std.fs.path.join(arena, &.{ v, "config" });
+                base_dir = v;
             } else {
                 printHelp();
                 return;
@@ -113,12 +115,31 @@ pub fn main() !void {
         }
     }
 
+    const config_path = try std.fs.path.join(arena, &.{ base_dir, "config" });
+    std.log.info("znode 启动: base={s} config={s}", .{ base_dir, config_path });
+
     const cfg = try config.loadFromPath(arena, config_path);
-    std.log.info("znode 启动: workers={d} inbounds={d} outbounds={d} default_outbound={s}", .{
+
+    // 解析日志目录：相对路径基于 base_dir
+    const log_dir = if (cfg.log.log_dir.len > 0 and !std.fs.path.isAbsolute(cfg.log.log_dir))
+        try std.fs.path.join(arena, &.{ base_dir, cfg.log.log_dir })
+    else if (cfg.log.log_dir.len > 0)
+        cfg.log.log_dir
+    else
+        try std.fs.path.join(arena, &.{ base_dir, "log" });
+
+    // 自动创建日志目录
+    std.fs.cwd().makePath(log_dir) catch |err| {
+        std.log.warn("创建日志目录失败: {s} err={s}", .{ log_dir, @errorName(err) });
+    };
+
+    try log.initGlobal(log_dir, log.Level.fromString(cfg.log.level), cfg.log.max_days);
+
+    std.log.info("workers={d} inbounds={d} outbounds={d} log={s}", .{
         cfg.workers,
         cfg.inbounds.len,
         cfg.outbounds.len,
-        cfg.routing.default_outbound,
+        log_dir,
     });
 
     try server.run(arena, &cfg);
