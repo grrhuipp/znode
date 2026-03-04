@@ -20,6 +20,3 @@ jobs:
       - name: Check x86_64-linux
         run: zig build check -Dtarget=x86_64-linux
 
-      - name: Check aarch64-linux
-        run: zig build check -Dtarget=aarch64-linux
-

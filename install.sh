@@ -19,14 +19,13 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# 检测架构
+# 检测架构（仅支持 x86_64）
 detect_arch() {
     local arch
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64)  echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *) error "不支持的架构: $arch" ;;
+        *) error "不支持的架构: $arch（仅支持 x86_64）" ;;
     esac
 }
 

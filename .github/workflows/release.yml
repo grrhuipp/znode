@@ -17,9 +17,6 @@ jobs:
           - target: x86_64-linux
             artifact: znode-linux-amd64
             cmake_arch: x86_64
-          - target: aarch64-linux
-            artifact: znode-linux-arm64
-            cmake_arch: aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -36,15 +33,35 @@ jobs:
         run: |
           git clone --depth 1 --branch main https://github.com/aws/aws-lc.git /tmp/aws-lc-src
 
-          # Create zig cc/c++ wrapper scripts for cross-compilation
+          # Create zig cc/c++ wrapper scripts that filter unsupported args
           mkdir -p /tmp/zigcc
           cat > /tmp/zigcc/zigcc <<'ZIGCC'
           #!/bin/bash
-          zig cc -target $ZIG_TARGET $@
+          args=()
+          skip=false
+          for a in "$@"; do
+            if $skip; then skip=false; continue; fi
+            case "$a" in
+              -Wp,*) ;;
+              --param) skip=true ;;
+              *) args+=("$a") ;;
+            esac
+          done
+          exec zig cc -target $ZIG_TARGET "${args[@]}"
           ZIGCC
           cat > /tmp/zigcc/zigcxx <<'ZIGCXX'
           #!/bin/bash
-          zig c++ -target $ZIG_TARGET $@
+          args=()
+          skip=false
+          for a in "$@"; do
+            if $skip; then skip=false; continue; fi
+            case "$a" in
+              -Wp,*) ;;
+              --param) skip=true ;;
+              *) args+=("$a") ;;
+            esac
+          done
+          exec zig c++ -target $ZIG_TARGET "${args[@]}"
           ZIGCXX
           chmod +x /tmp/zigcc/zigcc /tmp/zigcc/zigcxx
 
