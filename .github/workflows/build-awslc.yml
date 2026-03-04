@@ -12,9 +12,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-linux-musl-musl
+          - target: x86_64-linux-musl
             arch: x86_64
             lib_dir: x86_64-linux-musl
+          - target: x86_64-linux-gnu
+            arch: x86_64
+            lib_dir: x86_64-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +109,11 @@ jobs:
           name: awslc-x86_64-linux-musl
           path: deps/aws-lc/lib/x86_64-linux-musl
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: awslc-x86_64-linux-gnu
+          path: deps/aws-lc/lib/x86_64-linux-gnu
+
       - name: Commit libs
         run: |
           git config user.name "github-actions[bot]"
@@ -114,6 +122,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: rebuild aws-lc static libs (musl, zig cc)"
+            git commit -m "chore: rebuild aws-lc static libs (musl + gnu, zig cc)"
             git push
           fi
