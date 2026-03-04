@@ -143,11 +143,12 @@ pub const Logger = struct {
         self.error_ch.writeRaw(fmt, args);
     }
 
-    /// 写入 stdout。
+    /// 写入 stdout + app.log。
     pub fn console(self: *Logger, comptime fmt: []const u8, args: anytype) void {
         self.console_mu.lock();
         defer self.console_mu.unlock();
         self.writeConsole(fmt, args);
+        self.app_ch.writeFormatted(.info, fmt, args);
     }
 
     /// 动态调整日志级别（线程安全）。
