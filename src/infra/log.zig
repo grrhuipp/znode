@@ -71,11 +71,10 @@ const Channel = struct {
     }
 };
 
-/// Multi-channel logger: app.log, access.log, error.log + console.
+/// Multi-channel logger: app.log, access.log + console.
 ///
 /// - app.log:    程序日志（按 level 过滤）
-/// - access.log: 连接访问记录
-/// - error.log:  连接失败日志
+/// - access.log: 连接日志（访问记录 + 错误，合并输出）
 /// - console:    stdout 状态输出
 ///
 /// 并发设计：每个通道独立 Mutex，多 worker 写不同通道零争用。
@@ -86,7 +85,6 @@ pub const Logger = struct {
 
     app_ch: Channel = .{},
     access_ch: Channel = .{},
-    error_ch: Channel = .{},
     console_mu: std.Thread.Mutex = .{},
 
     initialized: bool = false,
@@ -112,7 +110,6 @@ pub const Logger = struct {
 
         self.app_ch.open(self.log_dir, "app.log");
         self.access_ch.open(self.log_dir, "access.log");
-        self.error_ch.open(self.log_dir, "error.log");
         self.initialized = true;
 
         self.writeConsole("日志系统已启动", .{});
@@ -123,7 +120,6 @@ pub const Logger = struct {
         defer self.init_mu.unlock();
         self.app_ch.close();
         self.access_ch.close();
-        self.error_ch.close();
         self.initialized = false;
     }
 
@@ -133,14 +129,14 @@ pub const Logger = struct {
         self.app_ch.writeFormatted(level, fmt, args);
     }
 
-    /// 写入 access.log。
+    /// 写入 access.log（连接访问记录）。
     pub fn access(self: *Logger, comptime fmt: []const u8, args: anytype) void {
         self.access_ch.writeRaw(fmt, args);
     }
 
-    /// 写入 error.log。
+    /// 写入 access.log（连接错误，与 access 合并）。
     pub fn connError(self: *Logger, comptime fmt: []const u8, args: anytype) void {
-        self.error_ch.writeRaw(fmt, args);
+        self.access_ch.writeRaw(fmt, args);
     }
 
     /// 写入 stdout + app.log。

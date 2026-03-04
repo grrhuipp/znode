@@ -25,6 +25,7 @@ pub const SessionContext = struct {
     // ── Source info (set by transport layer) ──────────────────────────────
     client_ip_buf: [46]u8 = undefined, // INET6_ADDRSTRLEN
     client_ip_len: u8 = 0,
+    client_port: u16 = 0,
     inbound_tag_buf: [128]u8 = undefined,
     inbound_tag_len: u8 = 0,
 
