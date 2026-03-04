@@ -8,9 +8,9 @@ set -euo pipefail
 #   变体: safe (默认,带符号), fast, debug, small
 
 REPO="grrhuipp/znode"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="/opt/znode"
 SERVICE_NAME="znode"
-CONFIG_DIR="/etc/znode"
+CONFIG_DIR="/opt/znode"
 
 # 颜色
 RED='\033[0;31m'
@@ -48,6 +48,7 @@ install_binary() {
     curl -fsSL "$url" -o "${tmpdir}/${artifact}.tar.gz" || error "下载失败: $url"
     tar xzf "${tmpdir}/${artifact}.tar.gz" -C "$tmpdir"
 
+    sudo mkdir -p "${INSTALL_DIR}"
     info "安装到 ${INSTALL_DIR}/znode..."
     sudo install -m 755 "${tmpdir}/${artifact}" "${INSTALL_DIR}/znode"
 }
@@ -68,7 +69,7 @@ setup_config() {
   "Workers": 0,
   "Log": {
     "level": "info",
-    "output": "/var/log/znode"
+    "output": "/opt/znode/log"
   },
   "Dns": {
     "servers": ["8.8.8.8", "1.1.1.1"]

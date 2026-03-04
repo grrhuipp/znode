@@ -26,7 +26,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/grrhuipp/znode/main/scripts/
 
 ## Config
 
-Default config directory: `/etc/znode/`
+Install directory: `/opt/znode/`
+
+```
+/opt/znode/
+  znode          # binary
+  config.json    # main config
+  inbound.json
+  outbound.json
+  route.json
+  log/           # log files
+```
 
 ## Service
 
