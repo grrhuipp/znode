@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # znode 一键安装/更新脚本
-# 用法: curl -fsSL https://raw.githubusercontent.com/grrhuipp/znode/main/install.sh | bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/grrhuipp/znode/main/scripts/install.sh | bash
 
 REPO="grrhuipp/znode"
 INSTALL_DIR="/usr/local/bin"

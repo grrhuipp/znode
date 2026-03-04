@@ -1,9 +1,9 @@
-name: Build & Release
+name: Autobuild
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,13 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-linux
-            artifact: znode-linux-amd64
-            cmake_arch: x86_64
-
     steps:
       - uses: actions/checkout@v4
 
@@ -26,99 +19,24 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
-
-      - name: Build aws-lc (musl via zig cc)
-        run: |
-          git clone --depth 1 --branch main https://github.com/aws/aws-lc.git /tmp/aws-lc-src
-
-          # Create zig cc/c++ wrapper scripts that filter unsupported args
-          mkdir -p /tmp/zigcc
-          cat > /tmp/zigcc/zigcc <<'ZIGCC'
-          #!/bin/bash
-          args=()
-          skip=false
-          for a in "$@"; do
-            if $skip; then skip=false; continue; fi
-            case "$a" in
-              -Wp,*) ;;
-              --param) skip=true ;;
-              *) args+=("$a") ;;
-            esac
-          done
-          exec zig cc -target $ZIG_TARGET "${args[@]}"
-          ZIGCC
-          cat > /tmp/zigcc/zigcxx <<'ZIGCXX'
-          #!/bin/bash
-          args=()
-          skip=false
-          for a in "$@"; do
-            if $skip; then skip=false; continue; fi
-            case "$a" in
-              -Wp,*) ;;
-              --param) skip=true ;;
-              *) args+=("$a") ;;
-            esac
-          done
-          exec zig c++ -target $ZIG_TARGET "${args[@]}"
-          ZIGCXX
-          chmod +x /tmp/zigcc/zigcc /tmp/zigcc/zigcxx
-
-          export ZIG_TARGET="${{ matrix.target }}-musl"
-
-          mkdir -p /tmp/aws-lc-build
-          cd /tmp/aws-lc-build
-          cmake /tmp/aws-lc-src \
-            -GNinja \
-            -DCMAKE_C_COMPILER=/tmp/zigcc/zigcc \
-            -DCMAKE_CXX_COMPILER=/tmp/zigcc/zigcxx \
-            -DCMAKE_ASM_COMPILER=/tmp/zigcc/zigcc \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_arch }} \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DBUILD_TESTING=OFF \
-            -DDISABLE_GO=ON \
-            -DDISABLE_PERL=ON \
-            -DCMAKE_ASM_FLAGS="-target $ZIG_TARGET"
-
-          ninja crypto ssl
-
-          # Copy built libs to project
-          LIB_DIR=$GITHUB_WORKSPACE/deps/aws-lc/lib/${{ matrix.cmake_arch }}-linux
-          mkdir -p $LIB_DIR
-          cp crypto/libcrypto.a $LIB_DIR/
-          cp ssl/libssl.a $LIB_DIR/
-
       - name: Build znode
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
 
       - name: Package
         run: |
           mkdir -p dist
-          cp zig-out/bin/znode dist/${{ matrix.artifact }}
-          chmod +x dist/${{ matrix.artifact }}
-          cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          cp zig-out/bin/znode dist/znode-linux-amd64
+          chmod +x dist/znode-linux-amd64
+          cd dist && tar czf znode-linux-amd64.tar.gz znode-linux-amd64
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.tar.gz
+      - name: Upload autobuild release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete autobuild --yes --cleanup-tag 2>/dev/null || true
+          gh release create autobuild dist/znode-linux-amd64.tar.gz \
+            --title "Autobuild" \
+            --notes "自动构建 (main branch)
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: artifacts/*.tar.gz
+          Commit: ${{ github.sha }}" \
+            --prerelease

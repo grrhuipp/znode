@@ -107,17 +107,12 @@ pub fn build(b: *std.Build) void {
 
 /// 根据目标平台返回预编译库路径，找不到返回 null。
 fn awslcLibDir(b: *std.Build, resolved: std.Target) ?[]const u8 {
+    if (resolved.os.tag != .linux) return null;
     const arch = switch (resolved.cpu.arch) {
         .x86_64 => "x86_64",
-        .aarch64 => "aarch64",
         else => return null,
     };
-    const os = switch (resolved.os.tag) {
-        .linux => "linux",
-        .windows => "windows",
-        else => return null,
-    };
-    const dir = b.fmt("deps/aws-lc/lib/{s}-{s}", .{ arch, os });
+    const dir = b.fmt("deps/aws-lc/lib/{s}-linux-musl", .{arch});
     const crypto_path = b.fmt("{s}/libcrypto.a", .{dir});
     std.fs.cwd().access(b.pathFromRoot(crypto_path), .{}) catch return null;
     return dir;

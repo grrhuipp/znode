@@ -18,5 +18,5 @@ jobs:
           version: 0.15.2
 
       - name: Check x86_64-linux
-        run: zig build check -Dtarget=x86_64-linux
+        run: zig build check -Dtarget=x86_64-linux-musl
 

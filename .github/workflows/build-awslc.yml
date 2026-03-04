@@ -2,9 +2,6 @@ name: Build aws-lc
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/build-awslc.yml'
 
 permissions:
   contents: write
@@ -15,9 +12,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-linux-musl
+          - target: x86_64-linux-musl-musl
             arch: x86_64
-            lib_dir: x86_64-linux
+            lib_dir: x86_64-linux-musl
 
     steps:
       - uses: actions/checkout@v4
@@ -106,8 +103,8 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: awslc-x86_64-linux
-          path: deps/aws-lc/lib/x86_64-linux
+          name: awslc-x86_64-linux-musl
+          path: deps/aws-lc/lib/x86_64-linux-musl
 
       - name: Commit libs
         run: |
