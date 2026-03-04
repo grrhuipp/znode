@@ -354,7 +354,7 @@ fn speedLimitBytes(mbps: i64) u64 {
 fn listenerFiber(runtime: *Runtime, inbound: *const InboundRuntime) void {
     const logger = log.getLogger();
     listenerLoop(runtime, inbound) catch |err| {
-        logger.app(.err, "监听 fiber 退出: tag={s} err={s}", .{ inbound.tag, @errorName(err) });
+        logger.console("监听 fiber 异常退出: tag={s} err={s}", .{ inbound.tag, @errorName(err) });
     };
 }
 

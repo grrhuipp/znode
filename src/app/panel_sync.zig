@@ -854,7 +854,7 @@ fn readHttpResponse(
         try buf.appendSlice(tmp[0..n]);
     }
 
-    return parseHttpResponse(buf.items);
+    return parseHttpResponse(allocator, buf.items);
 }
 
 fn readHttpResponseTls(
@@ -870,10 +870,10 @@ fn readHttpResponseTls(
         try buf.appendSlice(tmp[0..n]);
     }
 
-    return parseHttpResponse(buf.items);
+    return parseHttpResponse(allocator, buf.items);
 }
 
-fn parseHttpResponse(data: []const u8) !HttpResponse {
+fn parseHttpResponse(allocator: std.mem.Allocator, data: []const u8) !HttpResponse {
     // Find status line: "HTTP/1.1 200 OK\r\n"
     const status_end = std.mem.indexOf(u8, data, "\r\n") orelse
         return error.InvalidAddress;
@@ -910,35 +910,37 @@ fn parseHttpResponse(data: []const u8) !HttpResponse {
     const raw_body = data[header_end + 4 ..];
 
     if (is_chunked) {
-        return .{ .status = status, .body = decodeChunked(raw_body) };
+        const decoded = decodeChunkedAlloc(allocator, raw_body) catch raw_body;
+        return .{ .status = status, .body = decoded };
     }
     return .{ .status = status, .body = raw_body };
 }
 
-/// Decode chunked transfer encoding in-place (returns slice into same buffer).
-fn decodeChunked(data: []const u8) []const u8 {
-    // Find first chunk: "<hex-size>\r\n<data>\r\n..."
-    // Simple: find first '{' or '[' as JSON start
+/// Decode chunked transfer encoding into allocator-backed buffer.
+/// Format: <hex-size>\r\n<data>\r\n<hex-size>\r\n<data>\r\n0\r\n\r\n
+fn decodeChunkedAlloc(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+    var result = std.array_list.Managed(u8).init(allocator);
     var pos: usize = 0;
+
     while (pos < data.len) {
-        if (data[pos] == '{' or data[pos] == '[') {
-            // Find the end — look for "\r\n0\r\n" (final chunk marker) or just return to end
-            const json_start = pos;
-            // Scan for the end of this chunk
-            // In chunked encoding: after the data there's \r\n then next chunk size
-            // For simplicity, find the last '}' or ']' in the data
-            var json_end = data.len;
-            var i = data.len;
-            while (i > json_start) {
-                i -= 1;
-                if (data[i] == '}' or data[i] == ']') {
-                    json_end = i + 1;
-                    break;
-                }
-            }
-            return data[json_start..json_end];
+        // Parse chunk size (hex)
+        const size_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse break;
+        const size_str = std.mem.trim(u8, data[pos .. pos + size_end], " ");
+        if (size_str.len == 0) break;
+        const chunk_size = std.fmt.parseInt(usize, size_str, 16) catch break;
+        pos += size_end + 2; // skip "<size>\r\n"
+
+        if (chunk_size == 0) break; // final chunk
+        if (pos + chunk_size > data.len) break; // truncated
+
+        try result.appendSlice(data[pos .. pos + chunk_size]);
+        pos += chunk_size;
+
+        // Skip trailing \r\n after chunk data
+        if (pos + 2 <= data.len and data[pos] == '\r' and data[pos + 1] == '\n') {
+            pos += 2;
         }
-        pos += 1;
     }
-    return data;
+
+    return result.items;
 }
